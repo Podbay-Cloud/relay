@@ -4,7 +4,7 @@
  * The design (decided 2026-07-31): once the owner starts the relay, the pod may fetch
  * the public web through it freely — no per-request approval, because nobody watches a
  * terminal to click "allow". Oversight is after the fact: every fetch is audited, and
- * the owner monitors via `pb relay stats` and the admin dashboard.
+ * the owner monitors via `pb relay dashboard` and the admin dashboard.
  *
  * Two guards remain, and both protect the OWNER, not us:
  *  1. The relay refuses a URL that is not a plain web address or resolves to a bare IP

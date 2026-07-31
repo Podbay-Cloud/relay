@@ -4,8 +4,8 @@ import path from "node:path";
 
 /**
  * The relay's state on the owner's machine. Disk IS the shared state between the
- * background daemon and the `login`/`stats`/`stop` commands — no IPC needed: login
- * writes here and the daemon re-reads it per fetch; stats reads the audit log; stop
+ * background daemon and the `login`/`dashboard`/`stop` commands — no IPC needed: login
+ * writes here and the daemon re-reads it per fetch; dashboard reads the audit log; stop
  * reads the pidfile. Simpler and more robust than a socket.
  */
 export interface RelayConfig {

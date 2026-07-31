@@ -18,5 +18,5 @@ export const DISCLOSURE = `
    • The relay never fetches your private network (localhost, your LAN) and never
      sends a cookie or session back to a pod — only page content.
    • It uses a SEPARATE browser profile it owns; your everyday browser is untouched.
-   • Watch what it does any time with 'pb relay stats'.
+   • Watch what it does any time with 'pb relay dashboard'.
 `.trim();

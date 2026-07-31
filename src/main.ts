@@ -12,9 +12,9 @@ import { DISCLOSURE } from "./disclosure.js";
 import { normalizeDomain } from "./domain.js";
 
 /**
- * `pb relay` — one command starts a background relay; login/stats/stop modify it
+ * `pb relay` — one command starts a background relay; login/dashboard/stop modify it
  * through disk state (config, audit log, pidfile). No per-request approval: once
- * running, the pod fetches the public web freely; the owner watches via stats.
+ * running, the pod fetches the public web freely; the owner watches via the dashboard.
  */
 process.stdout.on("error", (e: NodeJS.ErrnoException) => { if (e.code === "EPIPE") process.exit(0); });
 const log = (s = ""): void => { try { process.stdout.write(s + "\n"); } catch { /* EPIPE */ } };
@@ -157,6 +157,6 @@ async function relay(a: string[]): Promise<void> {
 async function main(): Promise<void> {
   const [, , cmd, ...rest] = process.argv;
   if (cmd === "relay") return relay(rest);
-  log("usage: pb relay <start|login|stats|status|stop|reset>");
+  log("usage: pb relay <start|login|dashboard|status|stop|reset>");
 }
 void main();

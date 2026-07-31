@@ -19,7 +19,7 @@ export interface AuditSummary {
   byHost: { host: string; count: number; errors: number; session: boolean }[];
 }
 
-/** Summarise the audit for `pb relay stats`. Pure over the log's text so it is testable. */
+/** Summarise the audit for `pb relay dashboard`. Pure over the log's text so it is testable. */
 export function summarize(text: string): AuditSummary {
   const rows = text.split("\n").filter(Boolean).flatMap((l) => {
     try { return [JSON.parse(l) as { host: string; status: number; session: boolean; error?: string }]; } catch { return []; }
