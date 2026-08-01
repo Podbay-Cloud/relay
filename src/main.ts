@@ -9,6 +9,7 @@ import { BrowserFetcher } from "./browser-fetcher.js";
 import { record } from "./audit.js";
 import { serveDashboard } from "./dashboard.js";
 import { DISCLOSURE } from "./disclosure.js";
+import { c, rows } from "./colors.js";
 import { normalizeDomain } from "./domain.js";
 
 /**
@@ -37,7 +38,10 @@ async function cmdStart(a: string[]): Promise<void> {
 
   const cfg = load();
   const gateway = arg(a, "--gateway") ?? cfg.gatewayUrl ?? die("need --gateway wss://…");
-  const code = arg(a, "--code") ?? die("need --code (from your dashboard)");
+  // A code is only needed for FIRST pairing; a stored reconnect token lets a plain
+  // `pb relay start` bring the relay back up (e.g. after a reboot) with no new code.
+  const code = arg(a, "--code") ?? "";
+  if (!code && !cfg.reconnectToken) die("need --code (from your pod dashboard) to pair the first time");
 
   if (!cfg.consentedAt) {
     log(DISCLOSURE);
@@ -56,15 +60,22 @@ async function cmdStart(a: string[]): Promise<void> {
   });
   child.unref();
   writeFileSync(pidFile(), String(child.pid));
-  log(`relay started in the background (pid ${child.pid}).`);
-  log("  pb relay dashboard  see what it has fetched");
-  log("  pb relay login X  let site X be fetched as you");
-  log("  pb relay stop     stop it");
+  log("");
+  log(`  ${c.green(c.bold("✓ relay running"))} ${c.dim(`(pid ${child.pid}, in the background)`)}`);
+  log("");
+  log(
+    rows([
+      ["pb relay dashboard", "see what it has fetched"],
+      ["pb relay login <site>", "let a site be fetched as you"],
+      ["pb relay stop", "stop it"],
+    ]),
+  );
+  log("");
 }
 
 async function runDaemon(a: string[]): Promise<void> {
   const gateway = arg(a, "--gateway")!;
-  const code = arg(a, "--code")!;
+  const code = arg(a, "--code") ?? "";
   const browser = new BrowserFetcher({
     profileDir: profileDir(),
     // Re-read config each fetch: `pb relay login` writes there and we pick it up live.
@@ -72,17 +83,42 @@ async function runDaemon(a: string[]): Promise<void> {
   });
   let stopping = false;
   let backoff = 1000;
+  // Prefer a stored reconnect token (survives restarts/blips) over the one-time code,
+  // which is spent the instant the first pairing succeeds.
+  let token = load().reconnectToken;
 
   const connect = () => {
-    const ws = new WebSocket(`${gateway.replace(/\/$/, "")}/relay?code=${encodeURIComponent(code)}`);
+    const base = gateway.replace(/\/$/, "");
+    // A token reconnects; the code is only for the very first pairing.
+    const auth = token ? `token=${encodeURIComponent(token)}` : `code=${encodeURIComponent(code)}`;
+    const ws = new WebSocket(`${base}/relay?${auth}`);
     const client = new RelayClient({ send: (j) => { try { ws.send(j); } catch { /* closing */ } } }, browser.fetch, { audit: record });
     ws.on("open", () => { backoff = 1000; });
-    ws.on("message", (d) => void client.onMessage(String(d)));
+    ws.on("message", (d) => {
+      const raw = String(d);
+      // The gateway hands us a durable reconnect token at pairing — persist it so every
+      // future reconnect uses it, not the now-spent code.
+      try {
+        const m = JSON.parse(raw) as { type?: string; token?: string };
+        if (m.type === "relay-hello" && typeof m.token === "string" && m.token && m.token !== token) {
+          token = m.token;
+          const cfg = load();
+          cfg.reconnectToken = token;
+          save(cfg);
+        }
+      } catch { /* not our frame */ }
+      void client.onMessage(raw);
+    });
     ws.on("error", () => {});
     ws.on("close", (c) => {
       if (stopping) return;
-      // 4401 = the pairing code was rejected; retrying is pointless, so exit.
-      if (c === 4401) return void stop();
+      // 4401 = the credential was rejected. If we were using a token that expired/was
+      // revoked, fall back to the code ONCE (re-pair); if the code itself is rejected,
+      // give up — retrying is pointless.
+      if (c === 4401) {
+        if (token) { token = undefined; setTimeout(connect, 500); return; }
+        return void stop();
+      }
       // Otherwise a blip or a slept laptop — reconnect with backoff so the relay
       // survives without the owner restarting it.
       setTimeout(connect, Math.min(backoff, 30_000));
@@ -124,17 +160,24 @@ async function cmdDashboard(a: string[]): Promise<void> {
 function cmdStatus(): void {
   const pid = isRunning();
   const cfg = load();
-  log(`relay:    ${pid ? `running (pid ${pid})` : "not running"}`);
-  log(`gateway:  ${cfg.gatewayUrl ?? "(unset)"}`);
-  log(`as-you:   ${cfg.loginDomains.length ? cfg.loginDomains.join(", ") : "no sites signed in — all fetches are clean"}`);
+  const label = (s: string) => c.dim(s.padEnd(9));
+  log("");
+  log(`${label("relay")}${pid ? c.green(`running`) + c.dim(` (pid ${pid})`) : c.yellow("not running")}`);
+  log(`${label("gateway")}${cfg.gatewayUrl ? c.cyan(cfg.gatewayUrl) : c.dim("(unset)")}`);
+  log(
+    `${label("as-you")}${
+      cfg.loginDomains.length ? cfg.loginDomains.join(", ") : c.dim("no sites signed in — all fetches are clean")
+    }`,
+  );
+  log("");
 }
 
 function cmdStop(): void {
   const pid = isRunning();
-  if (!pid) return log("no relay running.");
+  if (!pid) return log(c.dim("no relay running."));
   process.kill(pid, "SIGTERM");
   try { unlinkSync(pidFile()); } catch {}
-  log("relay stopped.");
+  log(`${c.green("✓")} relay stopped.`);
 }
 
 async function relay(a: string[]): Promise<void> {
@@ -144,19 +187,35 @@ async function relay(a: string[]): Promise<void> {
     case "dashboard": return cmdDashboard(a.slice(1));
     case "status": return cmdStatus();
     case "stop": return cmdStop();
-    case "reset": resetProfile(); return log("wiped the relay's sessions and login list.");
+    case "reset": resetProfile(); return log(`${c.green("✓")} wiped the relay's sessions, logins, and pairing.`);
     default:
-      log("usage: pb relay <start|login|dashboard|status|stop|reset>");
-      log("  start --gateway <url> --code <code> [--accept]   run the relay in the background");
-      log("  login <domain>    let one site be fetched as you (everything else stays clean)");
-      log("  dashboard         open a local page of what it has fetched");
-      log("  status | stop | reset");
+      return relayUsage();
   }
+}
+
+function relayUsage(): void {
+  log("");
+  log(`${c.bold("pb relay")} ${c.dim("— fetch web pages through this machine for your Podbay pods")}`);
+  log("");
+  // `start` carries flags, so it gets its own line rather than blowing out the column.
+  log(`  ${c.cyan("start")}  ${c.dim("run the relay in the background:")}`);
+  log(`         ${c.dim("pb relay start --gateway <url> --code <code> --accept")}`);
+  log("");
+  log(
+    rows([
+      ["login <site>", "let one site be fetched as you (everything else stays clean)"],
+      ["dashboard", "open a local page of what it has fetched"],
+      ["status", "is it running, and for which sites"],
+      ["stop", "stop the relay"],
+      ["reset", "forget all sessions, logins, and pairing"],
+    ]),
+  );
+  log("");
 }
 
 async function main(): Promise<void> {
   const [, , cmd, ...rest] = process.argv;
   if (cmd === "relay") return relay(rest);
-  log("usage: pb relay <start|login|dashboard|status|stop|reset>");
+  relayUsage();
 }
 void main();

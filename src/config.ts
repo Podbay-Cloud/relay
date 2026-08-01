@@ -14,6 +14,9 @@ export interface RelayConfig {
    * with their session. Everything else is a clean, cookieless fetch. */
   loginDomains: string[];
   consentedAt?: string;
+  /** Durable reconnect token, handed to us at pairing. We reconnect with THIS (not the
+   * one-time code) so a gateway restart or network blip does not force re-pairing. */
+  reconnectToken?: string;
 }
 
 const dir = () => process.env.PB_RELAY_HOME ?? path.join(homedir(), ".podbay", "relay");
@@ -45,5 +48,9 @@ export function resetProfile(): void {
   if (existsSync(profileDir())) rmSync(profileDir(), { recursive: true, force: true });
   const cfg = load();
   cfg.loginDomains = [];
+  // Forget the reconnect token too — reset means fully un-pair; the next start needs a
+  // fresh code. (The gateway-side token expires on its own; a security revoke is a
+  // separate operation.)
+  delete cfg.reconnectToken;
   save(cfg);
 }
