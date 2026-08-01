@@ -139,11 +139,41 @@ async function cmdLogin(a: string[]): Promise<void> {
   )) as typeof import("playwright");
   log(`opening a browser so you can sign in to ${domain}. This is the relay's OWN profile.`);
   const ctx = await pw.chromium.launchPersistentContext(profileDir(), { headless: false, channel: "chrome" });
-  await ctx.newPage().then((p) => p.goto(`https://${domain}`, { waitUntil: "domcontentloaded" })).catch(() => undefined);
-  log("sign in (2FA included), then close the window to save.");
-  await new Promise<void>((r) => ctx.on("close", () => r()));
+  const first = await ctx.newPage();
+  await first.goto(`https://${domain}`, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+  log("");
+  log(`  ${c.bold("sign in")} ${c.dim("(2FA included), then just close the browser window.")}`);
+  log(`  ${c.dim("I'll save the session and quit the browser for you — no need to Cmd+Q.")}`);
+
+  // Wait until the owner closes the window — i.e. the context has no pages left.
+  // ctx.on("close") does NOT fire when the window is closed but Chrome stays running
+  // (macOS keeps the app alive), which used to leave this hanging AND the profile
+  // locked so the daemon's session fetches failed. Track pages instead.
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const check = () => {
+      // Defer so the closing page is already out of ctx.pages().
+      setTimeout(() => {
+        if (ctx.pages().length === 0) finish();
+      }, 100);
+    };
+    ctx.on("close", finish);
+    ctx.on("page", (p) => p.on("close", check));
+    first.on("close", check);
+  });
+
+  // Fully close the context → quits the Chrome the relay launched → releases the
+  // profile lock so the daemon can open it for session fetches.
+  await ctx.close().catch(() => undefined);
   addLoginDomain(domain);
-  log(`saved. ${domain} will now be fetched as you; every other site stays a clean, cookieless fetch.`);
+  log("");
+  log(`  ${c.green("✓ saved")} ${c.dim(`— ${domain} will now be fetched as you; every other site stays clean.`)}`);
+  log("");
 }
 
 async function cmdDashboard(a: string[]): Promise<void> {
