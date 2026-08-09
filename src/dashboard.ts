@@ -1,56 +1,368 @@
-import { createServer } from "node:http";
-import { readSummary } from "./audit.js";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
+import type { RelayEventStore } from "./audit.js";
+import { RelayEventStore as LocalEventStore } from "./audit.js";
+import {
+  eventsDir,
+  load,
+  setDomainBlocked,
+  setPodPaused,
+  setRetentionDays,
+  type RelayConfig,
+} from "./config.js";
+import { RelayRuntime, type RelayRuntimeSnapshot } from "./runtime.js";
 
-/**
- * A local web view of what the relay has fetched — served on the owner's own machine,
- * never exposed anywhere. This is the oversight that replaces per-request approval:
- * the owner can see, at any time, which sites were read, which used their session, and
- * what was refused.
- */
-const PAGE = `<!doctype html><meta charset=utf8><title>podbay relay</title>
-<style>
- :root{color-scheme:light dark}
- body{font:14px/1.5 system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem}
- h1{font-size:18px} .sub{color:#888;margin:-.3rem 0 1.2rem}
- .row{display:flex;gap:1.5rem;margin:.6rem 0 1.2rem}
- .stat b{font-size:22px;display:block} .stat span{color:#888;font-size:12px}
- table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
- th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #8883}
- th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#888}
- .tag{font-size:11px;padding:.1rem .4rem;border-radius:4px;background:#e0af6822;color:#e0af68}
- .err{color:#e5484d} td.n{text-align:right}
-</style>
-<h1>podbay relay</h1>
-<p class=sub>What this machine has fetched for your pods. Local only.</p>
-<div class=row id=stats></div>
-<table><thead><tr><th>site<th class=n>fetches<th class=n>failed<th>session</tr></thead><tbody id=rows></tbody></table>
-<script>
-async function tick(){
- const s = await (await fetch('/data')).json();
- stats.innerHTML = [['fetches',s.total],['ok',s.ok],['refused',s.refused],['as you',s.sessionFetches]]
-   .map(([k,v])=>'<div class=stat><b>'+v+'</b><span>'+k+'</span></div>').join('');
- rows.innerHTML = s.byHost.map(h=>'<tr><td>'+h.host+'<td class=n>'+h.count+
-   '<td class="n '+(h.errors?'err':'')+'">'+(h.errors||'')+'<td>'+(h.session?'<span class=tag>as you</span>':'')+'</tr>').join('')
-   || '<tr><td colspan=4 style=color:#888>nothing fetched yet</tr>';
+export interface DashboardEvent {
+  id: string;
+  at: string;
+  podId?: string;
+  mode: "fetch" | "tunnel";
+  outcome: "ok" | "site-refused" | "owner-blocked" | "safety-blocked" | "rate-limited" | "network-error";
+  target: string;
+  host: string;
+  status?: number;
+  ms: number;
+  session: boolean;
+  bytesUp?: number;
+  bytesDown?: number;
+  reason?: string;
 }
-tick(); setInterval(tick, 2000);
-</script>`;
 
-export function serveDashboard(port = 7373): Promise<{ url: string; close: () => void }> {
-  return new Promise((resolve) => {
+export interface DashboardData {
+  preview: boolean;
+  state: "connected" | "reconnecting" | "stopped";
+  stateSince: string;
+  updatedAt: string;
+  events: DashboardEvent[];
+  active: Array<{
+    id: string;
+    podId?: string;
+    mode: "fetch" | "tunnel";
+    target: string;
+    startedAt: string;
+    bytesUp?: number;
+    bytesDown?: number;
+  }>;
+  signedInSites: string[];
+  blockedSites: string[];
+  pausedPods: string[];
+  retentionDays: 7 | 30 | 90;
+  storagePath: string;
+  storageBytes: number;
+  trend: number[];
+}
+
+const SECURITY_HEADERS = {
+  "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  "referrer-policy": "no-referrer",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+};
+
+function json(res: ServerResponse, value: unknown): void {
+  res.writeHead(200, { ...SECURITY_HEADERS, "cache-control": "no-store", "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(value));
+}
+
+function previewData(now = Date.now()): DashboardData {
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  const events: DashboardEvent[] = [
+    { id: "ev-1", at: ago(2 * 60_000), podId: "research-otter-7f2a", mode: "fetch", outcome: "ok", target: "https://www.reddit.com/r/programming", host: "reddit.com", status: 200, ms: 2380, session: true },
+    { id: "ev-2", at: ago(8 * 60_000), podId: "market-scout-a912", mode: "tunnel", outcome: "ok", target: "www.linkedin.com:443", host: "linkedin.com", ms: 18_420, session: false, bytesUp: 83_291, bytesDown: 2_842_118 },
+    { id: "ev-3", at: ago(19 * 60_000), podId: "research-otter-7f2a", mode: "fetch", outcome: "site-refused", target: "https://www.crunchbase.com/organization/linear", host: "crunchbase.com", status: 403, ms: 1104, session: false, reason: "The site returned 403 Forbidden" },
+    { id: "ev-4", at: ago(37 * 60_000), podId: "docs-indexer-31bc", mode: "fetch", outcome: "ok", target: "https://docs.anthropic.com/en/docs/agents", host: "docs.anthropic.com", status: 200, ms: 892, session: false },
+    { id: "ev-5", at: ago(54 * 60_000), podId: "market-scout-a912", mode: "tunnel", outcome: "safety-blocked", target: "192.168.1.1:80", host: "192.168.1.1", ms: 1, session: false, bytesUp: 0, bytesDown: 0, reason: "Private-network targets are never reachable through the relay" },
+    { id: "ev-6", at: ago(75 * 60_000), podId: "research-otter-7f2a", mode: "fetch", outcome: "ok", target: "https://news.ycombinator.com/item", host: "news.ycombinator.com", status: 200, ms: 613, session: false },
+    { id: "ev-7", at: ago(2.2 * 60 * 60_000), podId: "market-scout-a912", mode: "tunnel", outcome: "network-error", target: "api.producthunt.com:443", host: "api.producthunt.com", ms: 10_004, session: false, bytesUp: 1843, bytesDown: 0, reason: "The remote host closed the connection" },
+    { id: "ev-8", at: ago(3.4 * 60 * 60_000), podId: "docs-indexer-31bc", mode: "fetch", outcome: "ok", target: "https://developer.mozilla.org/en-US/docs/Web/API", host: "developer.mozilla.org", status: 200, ms: 724, session: false },
+    { id: "ev-9", at: ago(4.1 * 60 * 60_000), podId: "research-otter-7f2a", mode: "fetch", outcome: "rate-limited", target: "https://www.reddit.com/r/MachineLearning", host: "reddit.com", status: 429, ms: 486, session: true, reason: "The site asked the relay to slow down" },
+    { id: "ev-10", at: ago(5.7 * 60 * 60_000), podId: "market-scout-a912", mode: "tunnel", outcome: "ok", target: "www.g2.com:443", host: "g2.com", ms: 44_201, session: false, bytesUp: 219_405, bytesDown: 6_139_551 },
+    { id: "ev-11", at: ago(9.5 * 60 * 60_000), mode: "tunnel", outcome: "ok", target: "relay.podbay.cloud:443", host: "relay.podbay.cloud", ms: 312, session: false, bytesUp: 0, bytesDown: 0, reason: "Automatic relay health check" },
+  ];
+  return {
+    preview: true,
+    state: "connected",
+    stateSince: ago(3.7 * 60 * 60_000),
+    updatedAt: new Date(now).toISOString(),
+    events,
+    active: [
+      { id: "live-1", podId: "market-scout-a912", mode: "tunnel", target: "www.linkedin.com:443", startedAt: ago(72_000), bytesUp: 42_831, bytesDown: 1_284_921 },
+      { id: "live-2", podId: "research-otter-7f2a", mode: "fetch", target: "https://www.reddit.com/r/startups", startedAt: ago(4_800) },
+    ],
+    signedInSites: ["reddit.com", "linkedin.com"],
+    blockedSites: ["x.com"],
+    pausedPods: [],
+    retentionDays: 30,
+    storagePath: "~/.podbay/relay/events",
+    storageBytes: 3_842_117,
+    trend: [3, 5, 4, 8, 6, 7, 12, 9, 14, 11, 18, 15, 21, 17, 24, 19, 28, 23],
+  };
+}
+
+export type DashboardFixture = "active" | "empty" | "healthy" | "failures" | "signed-in" | "legacy" | "stopped" | "large";
+
+export function fixtureData(name: DashboardFixture, now = Date.now()): DashboardData {
+  const data = previewData(now);
+  if (name === "active") return data;
+  if (name === "empty") return { ...data, events: [], active: [], signedInSites: [], blockedSites: [], trend: data.trend.map(() => 0) };
+  if (name === "healthy") return { ...data, events: data.events.filter((event) => event.podId === "docs-indexer-31bc" && event.outcome === "ok"), active: [], signedInSites: [], blockedSites: [] };
+  if (name === "failures") return { ...data, events: data.events.filter((event) => event.outcome !== "ok"), active: [] };
+  if (name === "signed-in") return { ...data, events: data.events.filter((event) => event.session), active: [] };
+  if (name === "legacy") return { ...data, events: [{ ...data.events[0]!, id: "legacy-unknown", podId: undefined }], active: [] };
+  if (name === "stopped") return { ...data, preview: false, state: "stopped", active: [] };
+  const seed = data.events;
+  return { ...data, events: Array.from({ length: 600 }, (_, index) => ({ ...seed[index % seed.length]!, id: `large-${index}`, at: new Date(now - index * 60_000).toISOString() })), active: [] };
+}
+
+function currentData(store: RelayEventStore, runtime: RelayRuntimeSnapshot, cfg: RelayConfig, now = Date.now()): DashboardData {
+  const events: DashboardEvent[] = store.query({ limit: 10_000 }).map((event) => ({
+    id: event.id,
+    at: event.startedAt,
+    ...(event.source && "podId" in event.source ? { podId: event.source.podId } : {}),
+    mode: event.mode,
+    outcome: event.outcome,
+    target: event.target,
+    host: event.host,
+    ...(event.httpStatus !== undefined ? { status: event.httpStatus } : {}),
+    ms: event.durationMs,
+    session: event.session,
+    ...(event.bytesUp !== undefined ? { bytesUp: event.bytesUp } : {}),
+    ...(event.bytesDown !== undefined ? { bytesDown: event.bytesDown } : {}),
+    ...(event.reason ? { reason: event.reason } : {}),
+  }));
+  const trend = Array.from({ length: 18 }, (_, index) => {
+    const end = now - (17 - index) * 3_600_000;
+    const start = end - 3_600_000;
+    return events.filter((event) => { const at = Date.parse(event.at); return at > start && at <= end; }).length;
+  });
+  return {
+    preview: false,
+    state: runtime.daemon === "stopped" ? "stopped" : runtime.gateway === "connected" ? "connected" : "reconnecting",
+    stateSince: runtime.stateSince,
+    updatedAt: runtime.updatedAt,
+    events,
+    active: runtime.active.map((work) => ({
+      id: work.id,
+      ...(work.source && "podId" in work.source ? { podId: work.source.podId } : {}),
+      mode: work.mode,
+      target: work.target,
+      startedAt: work.startedAt,
+      ...(work.bytesUp !== undefined ? { bytesUp: work.bytesUp } : {}),
+      ...(work.bytesDown !== undefined ? { bytesDown: work.bytesDown } : {}),
+    })),
+    signedInSites: cfg.loginDomains,
+    blockedSites: cfg.blockedDomains ?? [],
+    pausedPods: cfg.pausedPodIds ?? [],
+    retentionDays: cfg.retentionDays ?? 30,
+    storagePath: store.root,
+    storageBytes: store.storageBytes(),
+    trend,
+  };
+}
+
+const PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Relay · Podbay</title>
+<style>
+:root{color-scheme:dark;--bg:#09101d;--panel:#101a2b;--panel2:#142139;--line:#22324d;--text:#edf2f8;--muted:#91a0b7;--blue:#5d8dff;--blue2:#2f6bff;--green:#59d99b;--amber:#f3bd58;--red:#ee7f79;--violet:#b19bff;--radius:15px;--shadow:0 18px 60px #02060d66;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}html{background:var(--bg);scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 15% -15%,#183160 0,transparent 28rem),var(--bg);color:var(--text);font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}button,select,input{font:inherit}button{cursor:pointer}button:focus-visible,select:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px solid #8eb1ff;outline-offset:2px}.wrap{width:min(1180px,calc(100% - 40px));margin:0 auto 80px}.preview-ribbon{min-height:36px;display:flex;align-items:center;justify-content:center;gap:9px;background:#17243b;color:#b8c6dc;border-bottom:1px solid var(--line);font-size:12px;font-weight:650;letter-spacing:.01em}.preview-ribbon strong{color:#fff}.topbar{height:76px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #21304a99}.brand{display:flex;align-items:center;gap:11px;font-size:16px;font-weight:730;letter-spacing:-.02em}.mark{width:29px;height:29px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(145deg,var(--blue),#3159c8);box-shadow:0 8px 24px #2f6bff55;color:#fff;font:800 16px/1 ui-monospace,monospace}.top-meta{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px}.local-pill{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid var(--line);background:#0d1727;border-radius:999px}.local-pill:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px #59d99b1f}.hero{padding:48px 0 30px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:30px;align-items:start}.eyebrow{margin:0 0 9px;text-transform:uppercase;letter-spacing:.13em;font-weight:750;font-size:11px;color:#82a7ff}.hero h1{font-size:clamp(34px,5vw,53px);line-height:1.03;letter-spacing:-.045em;margin:0 0 15px;font-weight:760}.hero-copy{max-width:690px;margin:0;color:#aab7ca;font-size:16px;line-height:1.65}.state-card{min-width:310px;padding:17px 18px;border:1px solid #2b4166;background:linear-gradient(145deg,#142540,#0e192a);border-radius:var(--radius);box-shadow:var(--shadow)}.state-line{display:flex;align-items:center;gap:10px;margin-bottom:9px}.state-dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 5px #59d99b18}.state-card h2{font-size:15px;margin:0}.state-card p{font-size:12px;color:var(--muted);margin:0 0 14px;padding-left:20px}.state-actions{display:flex;gap:8px}.btn{border:1px solid var(--line);border-radius:9px;padding:8px 11px;background:#17243a;color:#dfe8f5;font-size:12px;font-weight:650;transition:.15s ease}.btn:hover{border-color:#4b6693;background:#1b2b46}.btn.danger{color:#ffb6b2;border-color:#713d43;background:#321b22}.btn.danger:hover{background:#472127}.btn.ghost{background:transparent}.btn.small{padding:6px 9px;font-size:11px}.section{margin-top:26px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:18px;margin-bottom:12px}.section h2{font-size:17px;letter-spacing:-.015em;margin:0}.section-kicker{font-size:12px;color:var(--muted);margin:4px 0 0}.mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode-card{display:grid;grid-template-columns:42px 1fr;gap:14px;padding:17px;border:1px solid var(--line);background:#0e1829cc;border-radius:var(--radius)}.mode-icon{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#1b2d4b;color:#9db9ff;font:750 13px/1 ui-monospace,monospace}.mode-card h3{font-size:13px;margin:1px 0 4px}.mode-card p{color:var(--muted);font-size:12px;margin:0;line-height:1.55}.mode-card b{color:#dbe5f3}.toolbar{display:flex;align-items:center;gap:8px}.select,.search{border:1px solid var(--line);background:#0e1828;color:#dfe8f5;border-radius:9px;padding:8px 31px 8px 10px;font-size:12px}.search{padding-right:10px;width:180px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.metric{position:relative;overflow:hidden;min-height:132px;padding:17px;border:1px solid var(--line);background:linear-gradient(150deg,#121e32,#0e1727);border-radius:var(--radius)}.metric-label{display:flex;align-items:center;justify-content:space-between;color:#a6b4c8;font-size:12px;font-weight:620}.metric-value{font-size:34px;line-height:1.1;letter-spacing:-.045em;margin-top:18px;font-weight:750;font-variant-numeric:tabular-nums}.metric-foot{margin-top:5px;color:var(--muted);font-size:11px}.metric-mark{width:7px;height:7px;border-radius:50%;background:var(--green)}.metric.issues .metric-mark{background:var(--amber)}.metric.session .metric-mark{background:var(--violet)}.attention{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:15px;padding:16px 17px;border:1px solid #715628;background:linear-gradient(95deg,#2b2217,#191b22 72%);border-radius:var(--radius)}.attention-icon{width:36px;height:36px;display:grid;place-items:center;border-radius:11px;background:#5d451f;color:#ffd68a;font-weight:800}.attention h3{font-size:13px;margin:0 0 3px}.attention p{font-size:12px;color:#c3ad88;margin:0}.trend-panel{display:grid;grid-template-columns:1fr 210px;gap:24px;padding:18px;border:1px solid var(--line);background:#0e1828;border-radius:var(--radius)}.chart{height:92px;display:flex;align-items:end;gap:7px;padding-top:8px}.bar{flex:1;min-width:5px;border-radius:4px 4px 2px 2px;background:linear-gradient(#658fff,#2e559f);opacity:.82;transition:.15s ease}.bar:hover{opacity:1;filter:brightness(1.18)}.trend-aside{border-left:1px solid var(--line);padding-left:22px;display:flex;flex-direction:column;justify-content:center}.trend-aside strong{font-size:24px;letter-spacing:-.03em}.trend-aside span{color:var(--muted);font-size:12px}.pods{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.pod{padding:17px;border:1px solid var(--line);background:#0f192a;border-radius:var(--radius);transition:.15s ease}.pod:hover{border-color:#3a527b;transform:translateY(-1px)}.pod.selected{border-color:#537fda;box-shadow:0 0 0 1px #537fda55;background:#121f35}.pod-top{display:flex;justify-content:space-between;gap:10px;align-items:start}.pod-name{font:650 12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dce6f5;overflow-wrap:anywhere}.pod-seen{color:var(--muted);font-size:10px;margin-top:4px}.pod-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:16px 0 13px}.pod-stat b{display:block;font-size:15px;font-variant-numeric:tabular-nums}.pod-stat span{color:var(--muted);font-size:10px}.pod-foot{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:12px}.pod-risk{font-size:11px;color:var(--muted)}.pod-risk.warn{color:#efbf68}.live-list,.events{border:1px solid var(--line);background:#0d1726;border-radius:var(--radius);overflow:hidden}.live-row{display:grid;grid-template-columns:100px 1fr 190px 130px;align-items:center;gap:14px;padding:14px 16px;border-bottom:1px solid var(--line)}.live-row:last-child{border:0}.pulse{display:inline-flex;align-items:center;gap:7px;color:#8ee7b9;font-size:11px;font-weight:680}.pulse:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px #59d99b18}.target{min-width:0}.target strong{display:block;font:590 12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.target span{color:var(--muted);font-size:10px}.live-meta{text-align:right}.live-meta b{display:block;font-size:12px;font-variant-numeric:tabular-nums}.live-meta span{font-size:10px;color:var(--muted)}.filters{display:flex;flex-wrap:wrap;gap:8px}.events-head,.event{display:grid;grid-template-columns:94px 132px 88px minmax(180px,1fr) 105px 70px;align-items:center;gap:12px}.events-head{padding:10px 16px;background:#111d30;color:#74849d;font-size:10px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}.event{position:relative;padding:13px 16px;border-top:1px solid var(--line);cursor:pointer}.event:hover{background:#111d30}.event-time{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}.pod-chip,.mode-chip,.outcome{display:inline-flex;align-items:center;width:max-content;max-width:100%;border-radius:7px;font-size:10px;font-weight:650}.pod-chip{padding:5px 7px;background:#16233a;color:#aebed5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis}.mode-chip{padding:5px 7px;border:1px solid #30486f;color:#9db8e8;text-transform:capitalize}.mode-chip.tunnel{border-color:#4e426e;color:#beaef0}.outcome{gap:6px;text-transform:capitalize}.outcome:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--green)}.outcome.bad{color:#f4c16b}.outcome.bad:before{background:var(--amber)}.outcome.blocked{color:#f09b94}.outcome.blocked:before{background:var(--red)}.bytes{text-align:right;font-size:11px;font-variant-numeric:tabular-nums;color:#b9c5d6}.event-detail{grid-column:1/-1;display:none;margin-top:3px;padding:12px;border-radius:9px;background:#0a1321;color:#a7b5c9;font-size:11px}.event.open .event-detail{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.detail-item b{display:block;color:#75869f;font-size:9px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px}.detail-item span{overflow-wrap:anywhere}.bottom-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:12px}.panel{border:1px solid var(--line);background:#0e1828;border-radius:var(--radius);overflow:hidden}.panel-title{padding:16px 17px 12px}.panel-title h3{font-size:14px;margin:0}.panel-title p{color:var(--muted);font-size:11px;margin:3px 0 0}.site-row{display:grid;grid-template-columns:1fr 80px 88px 82px;align-items:center;gap:10px;padding:12px 17px;border-top:1px solid var(--line);font-size:11px}.site-row b{font:600 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.site-row span{text-align:right;color:#aebbd0;font-variant-numeric:tabular-nums}.setting{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:13px 17px;border-top:1px solid var(--line)}.setting b{display:block;font-size:11px}.setting p{margin:3px 0 0;color:var(--muted);font-size:10px}.tag-list{display:flex;gap:6px;flex-wrap:wrap}.tag{display:inline-flex;align-items:center;gap:5px;padding:5px 7px;border-radius:7px;background:#17243a;color:#b8c7dc;font-size:10px}.tag.signed:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--violet)}.tag.blocked{background:#301f26;color:#efaaa5}.empty{padding:28px;text-align:center;color:var(--muted);font-size:12px}.footer-note{display:flex;justify-content:space-between;gap:20px;margin-top:18px;color:#71819a;font-size:11px}.toast{position:fixed;right:22px;bottom:22px;z-index:20;max-width:340px;padding:12px 15px;border:1px solid #3a527b;border-radius:11px;background:#16233a;color:#e7eef8;box-shadow:var(--shadow);font-size:12px;opacity:0;transform:translateY(8px);pointer-events:none;transition:.18s ease}.toast.show{opacity:1;transform:none}.hidden{display:none!important}
+.topbar{position:sticky;top:0;z-index:12;margin:0 -20px;padding:0 20px;background:#09101df2;backdrop-filter:blur(18px)}.header-right{display:flex;align-items:center;gap:10px}.header-state{display:flex;align-items:center;gap:8px;padding-right:4px}.header-state-copy{display:flex;flex-direction:column}.header-state-copy b{font-size:11px;line-height:1.2}.header-state-copy span{font-size:9px;color:var(--muted)}.state-dot.compact{width:8px;height:8px;box-shadow:0 0 0 4px #59d99b18}.tabs-shell{position:sticky;top:76px;z-index:11;display:flex;align-items:center;justify-content:space-between;gap:18px;margin:0 -20px;padding:0 20px;border-bottom:1px solid var(--line);background:#09101df2;backdrop-filter:blur(18px)}.tab-list{display:flex;align-items:center;gap:2px;min-width:0}.tab{position:relative;display:inline-flex;align-items:center;gap:7px;padding:15px 15px 13px;border:0;border-bottom:2px solid transparent;background:transparent;color:#8696ae;font-size:12px;font-weight:670}.tab:hover{color:#dce6f5}.tab[aria-selected="true"]{color:#f4f7fb;border-bottom-color:var(--blue)}.tab-badge{display:inline-grid;place-items:center;min-width:19px;height:18px;padding:0 5px;border-radius:999px;background:#1b2940;color:#aebed6;font-size:9px;font-variant-numeric:tabular-nums}.tab-badge.attention-count{background:#4b381d;color:#ffd081}.tab-range{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:10px}[data-tab-panel][hidden]{display:none}.tab-panel{padding-top:4px}.tab-heading{display:flex;align-items:end;justify-content:space-between;gap:20px;padding:38px 0 4px}.tab-heading h1{font-size:28px;letter-spacing:-.035em;margin:0}.tab-heading p{margin:5px 0 0;color:var(--muted);font-size:13px}.overview-glance{display:grid;grid-template-columns:1fr 1fr;gap:12px}.glance-panel{border:1px solid var(--line);border-radius:var(--radius);background:#0e1828;overflow:hidden}.glance-head{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid var(--line)}.glance-head h3{font-size:13px;margin:0}.compact-list{min-height:130px}.compact-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}.compact-row:last-child{border:0}.compact-row strong{display:block;font:600 11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.compact-row span{display:block;color:var(--muted);font-size:10px}.compact-value{text-align:right!important;color:#d9e3f1!important;font-variant-numeric:tabular-nums}.subtabs{display:inline-flex;padding:3px;border:1px solid var(--line);border-radius:10px;background:#0c1524}.subtab{border:0;border-radius:7px;padding:7px 12px;background:transparent;color:var(--muted);font-size:11px;font-weight:650}.subtab[aria-selected="true"]{background:#1a2941;color:#eef3fa;box-shadow:0 1px 3px #0005}.controls-layout{display:grid;grid-template-columns:330px minmax(0,1fr);gap:12px;margin-top:22px}.control-hero{padding:20px;border:1px solid #2d456c;border-radius:var(--radius);background:linear-gradient(150deg,#14243c,#0d1726)}.control-hero h2{font-size:17px;margin:0 0 7px}.control-hero>p{color:var(--muted);font-size:12px;margin:0 0 19px}.control-rule{display:flex;gap:11px;padding:13px 0;border-top:1px solid var(--line)}.control-rule:first-of-type{border-top:0}.control-rule i{width:26px;height:26px;display:grid;place-items:center;flex:0 0 auto;border-radius:8px;background:#1d3151;color:#9db9ff;font-style:normal;font-size:11px;font-weight:750}.control-rule b{display:block;font-size:11px}.control-rule span{display:block;margin-top:2px;color:var(--muted);font-size:10px;line-height:1.45}.controls-panel{align-self:start}.controls-footer{margin-top:14px}.hero{display:block;max-width:900px;padding-bottom:24px}.hero h1 br{display:none}
+@media(max-width:900px){.hero{grid-template-columns:1fr}.state-card{min-width:0}.metrics{grid-template-columns:1fr 1fr}.pods{grid-template-columns:1fr}.trend-panel,.bottom-grid,.overview-glance,.controls-layout{grid-template-columns:1fr}.trend-aside{border-left:0;border-top:1px solid var(--line);padding:14px 0 0}.live-row{grid-template-columns:90px 1fr 110px}.live-meta:last-child{display:none}.events-head{display:none}.event{grid-template-columns:92px 96px 1fr}.event .target{grid-column:2/-1}.event .outcome{grid-column:2}.event .bytes{grid-column:3;grid-row:3}.event.open .event-detail{grid-template-columns:1fr 1fr}.mode-grid{grid-template-columns:1fr}.header-state-copy span{display:none}}
+@media(max-width:700px){.topbar{height:64px}.tabs-shell{top:64px;overflow-x:auto;scrollbar-width:none}.tabs-shell::-webkit-scrollbar{display:none}.tab-list{flex:0 0 auto}.tab-range{display:none}.header-right .top-meta{display:none}.header-state-copy{display:none}.topbar .btn{padding:7px 9px}.tab{padding:13px 11px 11px}}
+@media(max-width:580px){.wrap{width:min(100% - 24px,1180px)}.topbar{height:64px;margin:0 -12px;padding:0 12px}.tabs-shell{margin:0 -12px;padding:0 5px}.top-meta>span:first-child{display:none}.hero{padding-top:32px}.hero h1{font-size:36px}.hero-copy{font-size:14px}.metrics{grid-template-columns:1fr 1fr;gap:8px}.metric{min-height:116px;padding:14px}.metric-value{font-size:28px}.attention{grid-template-columns:auto 1fr}.attention .btn{grid-column:1/-1}.section-head,.tab-heading{align-items:start;flex-direction:column}.tab-heading{padding-top:28px}.toolbar{width:100%;flex-wrap:wrap}.select,.search{min-width:0;flex:1}.live-row{grid-template-columns:1fr 1fr}.live-row .target{grid-column:1/-1;grid-row:2}.event{grid-template-columns:1fr auto;gap:8px}.event-time{grid-column:1}.event .pod-chip{grid-column:1;grid-row:2}.event .mode-chip{grid-column:2;grid-row:2}.event .target{grid-column:1/-1;grid-row:3}.event .outcome{grid-column:1;grid-row:4}.event .bytes{grid-column:2;grid-row:4}.event.open .event-detail{grid-template-columns:1fr}.site-row{grid-template-columns:1fr 70px}.site-row span:nth-child(3),.site-row span:nth-child(4){display:none}.footer-note{flex-direction:column}.preview-ribbon{padding:7px 12px;text-align:center}.local-pill{padding:6px 8px}.tab{font-size:11px}.tab-badge{min-width:17px;height:16px}.controls-layout{margin-top:12px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}.pod:hover{transform:none}}
+</style>
+</head>
+<body data-api-base="__API_BASE__" data-csrf="__CSRF__" data-read-only="__READ_ONLY__">
+<div id="previewRibbon" class="preview-ribbon hidden"><strong>UX preview</strong><span>Sample data · controls are simulated on this page</span></div>
+<div class="wrap">
+  <header class="topbar"><div class="brand"><span class="mark">p</span><span>Podbay relay</span></div><div class="header-right"><div class="header-state"><span id="stateDot" class="state-dot compact"></span><div class="header-state-copy"><b id="stateTitle">Relay connected</b><span id="stateDetail">Pods can use this connection</span></div></div><div class="top-meta"><span id="updated">Updated now</span><span class="local-pill">Local to this computer</span></div><button class="btn danger" data-action="stop">Stop relay</button></div></header>
+  <nav class="tabs-shell" aria-label="Relay dashboard sections"><div class="tab-list" role="tablist"><button id="tab-overview" class="tab" role="tab" aria-controls="panel-overview" aria-selected="true" data-tab="overview">Overview</button><button id="tab-activity" class="tab" role="tab" aria-controls="panel-activity" aria-selected="false" data-tab="activity">Activity <span id="activityBadge" class="tab-badge attention-count">0</span></button><button id="tab-pods" class="tab" role="tab" aria-controls="panel-pods" aria-selected="false" data-tab="pods">Pods <span id="podsBadge" class="tab-badge">0</span></button><button id="tab-controls" class="tab" role="tab" aria-controls="panel-controls" aria-selected="false" data-tab="controls">Controls <span id="controlsBadge" class="tab-badge">0</span></button></div><label class="tab-range"><span>Range</span><select id="range" class="select" aria-label="Time range"><option value="24">Last 24 hours</option><option value="6">Last 6 hours</option><option value="1">Last hour</option></select></label></nav>
+  <main>
+    <section id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview" data-tab-panel="overview"><div class="hero"><p class="eyebrow">Your connection · your control</p><h1>See what your pods borrowed from you.</h1><p class="hero-copy">The relay lets your pods reach the public web through this computer. This command center shows which pod asked, what happened, and where you can narrow access.</p></div><div class="mode-grid" aria-label="How the relay works"><article class="mode-card"><span class="mode-icon">GET</span><div><h3>Page fetch</h3><p>The relay's browser returns a page to an agent. <b>Signed-in access is used only for sites you chose.</b></p></div></article><article class="mode-card"><span class="mode-icon">↗</span><div><h3>Live tunnel</h3><p>A pod app routes a connection through your IP. <b>It never receives or uses your browser cookies.</b></p></div></article></div><section class="section"><div class="section-head"><div><h2>Overview</h2><p class="section-kicker" id="rangeCopy">What this computer handled in the last 24 hours</p></div></div><div id="metrics" class="metrics"></div></section><section id="attentionSection" class="section"><div class="attention"><span class="attention-icon">!</span><div><h3 id="attentionTitle">3 events deserve a look</h3><p id="attentionCopy">A site refused a request, one connection failed, and a private-network target was safely blocked.</p></div><button class="btn" data-action="review-issues">Review events</button></div></section><section class="section"><div class="section-head"><div><h2>Usage over time</h2><p class="section-kicker">Requests and connections · grouped by hour</p></div></div><div class="trend-panel"><div id="chart" class="chart" aria-label="Relay activity by hour"></div><div class="trend-aside"><strong id="trendValue">+18%</strong><span>versus the previous 24 hours</span></div></div></section><section class="section overview-glance"><div class="glance-panel"><div class="glance-head"><h3>Live now</h3><button class="btn ghost small" data-tab-jump="activity">Open activity</button></div><div id="overviewLive" class="compact-list"></div></div><div class="glance-panel"><div class="glance-head"><h3>Recent pods</h3><button class="btn ghost small" data-tab-jump="pods">Manage pods</button></div><div id="overviewPods" class="compact-list"></div></div></section></section>
+    <section id="panel-activity" class="tab-panel" role="tabpanel" aria-labelledby="tab-activity" data-tab-panel="activity" hidden><div class="tab-heading"><div><p class="eyebrow">Inspect what happened</p><h1>Activity</h1><p>Live connections and your detailed local audit.</p></div><button id="clearPodFilter" class="btn ghost small hidden" data-action="clear-pod">Clear pod filter</button></div><section class="section"><div class="section-head"><div><h2>Live now</h2><p class="section-kicker">Connections and fetches currently using this computer</p></div></div><div id="live" class="live-list"></div></section><section class="section"><div class="section-head"><div><h2 id="activityViewTitle">Events</h2><p id="activityCopy" class="section-kicker">A chronological local record · click a row for details</p></div><div class="subtabs" role="tablist" aria-label="Activity view"><button class="subtab" role="tab" aria-selected="true" data-activity-view="events">Events</button><button class="subtab" role="tab" aria-selected="false" data-activity-view="sites">Sites</button></div></div><div id="eventsPane"><div class="filters" style="margin-bottom:10px"><select id="modeFilter" class="select" aria-label="Filter by mode"><option value="all">All modes</option><option value="fetch">Fetches</option><option value="tunnel">Tunnels</option></select><select id="outcomeFilter" class="select" aria-label="Filter by outcome"><option value="all">All outcomes</option><option value="issue">Issues only</option><option value="ok">Successful</option><option value="site-refused">Site refused</option><option value="safety-blocked">Safety blocked</option><option value="network-error">Network errors</option></select><input id="siteFilter" class="search" type="search" placeholder="Filter by site" aria-label="Filter activity by site"></div><div id="events" class="events"></div></div><div id="sitesPane" class="panel hidden"><div class="panel-title"><h3>Sites</h3><p>Where this computer connected in the selected range</p></div><div id="sites"></div></div></section></section>
+    <section id="panel-pods" class="tab-panel" role="tabpanel" aria-labelledby="tab-pods" data-tab-panel="pods" hidden><div class="tab-heading"><div><p class="eyebrow">Attribute and narrow access</p><h1>Pods</h1><p>See which pod used your connection, then pause it or inspect its activity.</p></div><button class="btn ghost small" data-action="clear-pod">Clear selection</button></div><section class="section"><div id="pods" class="pods"></div></section></section>
+    <section id="panel-controls" class="tab-panel" role="tabpanel" aria-labelledby="tab-controls" data-tab-panel="controls" hidden><div class="tab-heading"><div><p class="eyebrow">Authority and local data</p><h1>Controls</h1><p>Manage what your pods may borrow and how long this computer remembers it.</p></div></div><div class="controls-layout"><aside class="control-hero"><h2>Your relay stays open by default</h2><p>Pods can reach the public web while the relay runs. These controls let you narrow that authority without maintaining an allowlist.</p><div class="control-rule"><i>IP</i><div><b>Private networks stay unreachable</b><span>Localhost, routers, NAS devices, and LAN targets are blocked independently.</span></div></div><div class="control-rule"><i>ID</i><div><b>Signed-in access is separate</b><span>Only sites you explicitly lend can use the relay's browser session.</span></div></div><div class="control-rule"><i>■</i><div><b>Stop is always global</b><span>The persistent header can cut off all relay traffic from any tab.</span></div></div><button class="btn ghost" data-action="copy-url">Copy local dashboard URL</button></aside><div class="panel controls-panel"><div class="panel-title"><h3>Relay access and history</h3><p>These settings live only on this computer</p></div><div class="setting"><div><b>Signed-in sites</b><p>Fetch may act as you on these sites</p></div><div id="signedSites" class="tag-list"></div></div><div class="setting"><div><b>Blocked sites</b><p>No pod can use your relay for these sites</p></div><div id="blockedSites" class="tag-list"></div></div><div class="setting"><div><b>Keep activity</b><p id="storageCopy">30 days · 3.7 MB on disk</p></div><select id="retention" class="select" aria-label="History retention"><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></div><div class="setting"><div><b>Local history</b><p id="storagePath">~/.podbay/relay/events</p></div><div class="toolbar"><button class="btn small" data-action="export">Export</button><button class="btn small danger" data-action="clear-history">Clear</button></div></div></div></div><div class="footer-note controls-footer"><span>Full detail stays here. Podbay retains only coarse domain-level relay telemetry.</span><span>Queries, fragments, cookies, content, and credentials are never shown.</span></div></section>
+  </main>
+</div><div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script>
+const app={data:null,selectedPod:null,mode:'all',outcome:'all',site:'',stopped:false,tab:'overview',activityView:'events'};
+const $=id=>document.getElementById(id);
+const fmtBytes=n=>{n=n||0;if(n>=1048576)return(n/1048576).toFixed(n>=10485760?0:1)+' MB';if(n>=1024)return Math.round(n/1024)+' KB';return n+' B'};
+const fmtDuration=ms=>ms>=60000?Math.floor(ms/60000)+'m '+Math.floor(ms%60000/1000)+'s':ms>=1000?(ms/1000).toFixed(ms<10000?1:0)+'s':ms+'ms';
+const timeAgo=iso=>{const s=Math.max(0,Math.floor((Date.now()-new Date(iso).getTime())/1000));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'};
+const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=String(text);return node};
+function toast(message){const t=$('toast');t.textContent=message;t.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.classList.remove('show'),2600)}
+const apiBase=document.body.dataset.apiBase||'';const readOnly=document.body.dataset.readOnly==='true';
+async function mutate(action,body={}){if(readOnly)throw new Error('Relay is stopped — controls are read only');const response=await fetch(apiBase+'/actions/'+action,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':document.body.dataset.csrf||''},body:JSON.stringify(body)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Action failed');await load();return data}
+function activateTab(name,writeHash=true){const allowed=['overview','activity','pods','controls'];if(!allowed.includes(name))name='overview';app.tab=name;document.querySelectorAll('[data-tab]').forEach(tab=>{const active=tab.dataset.tab===name;tab.setAttribute('aria-selected',String(active));tab.tabIndex=active?0:-1});document.querySelectorAll('[data-tab-panel]').forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==name});document.querySelector('.tab-range').classList.toggle('hidden',name==='controls');if(writeHash&&location.hash!=='#'+name)history.pushState(null,'','#'+name);window.scrollTo({top:0,behavior:'instant'})}
+function activateActivityView(name){app.activityView=name;document.querySelectorAll('[data-activity-view]').forEach(tab=>tab.setAttribute('aria-selected',String(tab.dataset.activityView===name)));$('eventsPane').classList.toggle('hidden',name!=='events');$('sitesPane').classList.toggle('hidden',name!=='sites');$('activityViewTitle').textContent=name==='events'?'Events':'Sites by usage';$('activityCopy').textContent=name==='events'?scopedEvents().length+' events · detailed history stored locally':'Domain rollup for the selected time range'}
+function inRange(event){const hours=Number($('range').value);return Date.now()-new Date(event.at).getTime()<=hours*3600000}
+function scopedEvents(){return app.data.events.filter(e=>inRange(e)&&(!app.selectedPod||e.podId===app.selectedPod)&&(app.mode==='all'||e.mode===app.mode)&&(app.outcome==='all'||(app.outcome==='issue'?e.outcome!=='ok':e.outcome===app.outcome))&&(!app.site||e.host.toLowerCase().includes(app.site)))}
+function allRangeEvents(){return app.data.events.filter(inRange)}
+function renderState(){const state=app.stopped?'stopped':app.data.state;const title=state==='connected'?'Relay connected':state==='reconnecting'?'Relay reconnecting':'Relay stopped';$('stateTitle').textContent=title;$('stateDetail').textContent=state==='connected'?'Pods can use this connection':state==='reconnecting'?'Saved history remains available':'Showing saved local history';$('stateDot').style.background=state==='connected'?'var(--green)':state==='reconnecting'?'var(--amber)':'var(--red)';const stop=document.querySelector('[data-action="stop"]');stop.textContent=state==='stopped'?'Relay stopped':'Stop relay';stop.disabled=state==='stopped';document.querySelector('[data-action="clear-history"]').disabled=readOnly}
+function renderMetrics(){const rows=allRangeEvents();const ok=rows.filter(e=>e.outcome==='ok').length;const issues=rows.length-ok;const data=rows.reduce((n,e)=>n+(e.bytesUp||0)+(e.bytesDown||0),0);const sessions=rows.filter(e=>e.session).length;const defs=[['Successful',String(ok),'completed fetches + connections',''],['Needs attention',String(issues),'blocked, refused, or failed','issues'],['Data routed',fmtBytes(data),'tunnel traffic through this computer',''],['Signed-in fetches',String(sessions),'used a session you explicitly lent','session']];const root=$('metrics');root.replaceChildren();defs.forEach(d=>{const card=el('article','metric '+d[3]);const label=el('div','metric-label');label.append(el('span','',d[0]),el('span','metric-mark'));card.append(label,el('div','metric-value',d[1]),el('div','metric-foot',d[2]));root.append(card)});$('rangeCopy').textContent='What this computer handled in the last '+$('range').selectedOptions[0].text.toLowerCase()}
+function renderAttention(){const rows=allRangeEvents().filter(e=>e.outcome!=='ok');$('attentionSection').classList.toggle('hidden',rows.length===0);$('attentionTitle').textContent=rows.length+' event'+(rows.length===1?'':'s')+' deserve a look';const labels=[...new Set(rows.map(e=>e.outcome==='site-refused'?'a site refusal':e.outcome==='safety-blocked'?'a safely blocked private target':e.outcome==='network-error'?'a connection error':e.outcome==='rate-limited'?'a rate limit':'an owner block'))];$('attentionCopy').textContent=labels.slice(0,3).join(', ').replace(/^./,c=>c.toUpperCase())+'.'}
+function renderChart(){const root=$('chart');root.replaceChildren();const max=Math.max(...app.data.trend,1);app.data.trend.forEach((n,i)=>{const b=el('span','bar');b.style.height=Math.max(8,n/max*100)+'%';b.title=n+' events · '+(app.data.trend.length-i)+' hours ago';root.append(b)})}
+function podRows(){const map=new Map();allRangeEvents().filter(e=>e.podId).forEach(e=>{const p=map.get(e.podId)||{id:e.podId,fetch:0,tunnel:0,bytes:0,issues:0,session:0,last:e.at};p[e.mode]++;p.bytes+=(e.bytesUp||0)+(e.bytesDown||0);p.issues+=e.outcome==='ok'?0:1;p.session+=e.session?1:0;if(e.at>p.last)p.last=e.at;map.set(e.podId,p)});return[...map.values()].sort((a,b)=>b.last.localeCompare(a.last))}
+function renderPods(){const root=$('pods');root.replaceChildren();podRows().forEach(p=>{const card=el('article','pod'+(app.selectedPod===p.id?' selected':''));card.tabIndex=0;card.setAttribute('role','button');card.setAttribute('aria-label','View activity for '+p.id);const top=el('div','pod-top'),ident=el('div');ident.append(el('div','pod-name',p.id),el('div','pod-seen','Last used '+timeAgo(p.last)));const paused=app.data.pausedPods.includes(p.id);const pause=el('button','btn small'+(paused?' danger':''),paused?'Resume':'Pause');pause.disabled=readOnly;pause.addEventListener('click',async ev=>{ev.stopPropagation();if(!confirm((paused?'Resume ':'Pause ')+p.id+' relay access?'))return;try{await mutate('pod',{podId:p.id,paused:!paused});toast((paused?'Resumed ':'Paused ')+p.id)}catch(error){toast(error.message)}});top.append(ident,pause);const stats=el('div','pod-stats');[[p.fetch,'fetches'],[p.tunnel,'tunnels'],[fmtBytes(p.bytes),'data']].forEach(x=>{const n=el('div','pod-stat');n.append(el('b','',x[0]),el('span','',x[1]));stats.append(n)});const foot=el('div','pod-foot');foot.append(el('span','pod-risk'+(p.issues?' warn':''),p.issues?p.issues+' issue'+(p.issues===1?'':'s'):'No issues'),el('span','pod-risk','View activity →'));card.append(top,stats,foot);const select=()=>{app.selectedPod=p.id;renderEvents();renderLive();$('clearPodFilter').classList.remove('hidden');activateTab('activity')};card.addEventListener('click',select);card.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();select()}});root.append(card)});if(!root.children.length)root.append(el('div','empty','No pod activity in this range.'))}
+function renderLiveInto(root,compact=false){root.replaceChildren();const rows=app.data.active.filter(x=>!app.selectedPod||x.podId===app.selectedPod);rows.slice(0,compact?3:rows.length).forEach(x=>{if(compact){const row=el('div','compact-row');const copy=el('div');copy.append(el('strong','',x.target),el('span','',(x.podId||'System health check')+' · '+(x.mode==='tunnel'?'streaming':'fetching')));row.append(copy,el('span','compact-value',fmtDuration(Date.now()-new Date(x.startedAt).getTime())));root.append(row);return}const row=el('div','live-row');row.append(el('span','pulse',x.mode==='tunnel'?'Streaming':'Fetching'));const target=el('div','target');target.append(el('strong','',x.target),el('span','',x.podId||'System health check'));const dur=el('div','live-meta');dur.append(el('b','',fmtDuration(Date.now()-new Date(x.startedAt).getTime())),el('span','','elapsed'));const bytes=el('div','live-meta');bytes.append(el('b','',x.mode==='tunnel'?fmtBytes((x.bytesUp||0)+(x.bytesDown||0)):'Waiting for page'),el('span','',x.mode==='tunnel'?'↑ '+fmtBytes(x.bytesUp)+' · ↓ '+fmtBytes(x.bytesDown):'browser fetch'));row.append(target,dur,bytes);root.append(row)});if(!rows.length)root.append(el('div','empty','Nothing is using this connection right now.'))}
+function renderLive(){renderLiveInto($('live'));renderLiveInto($('overviewLive'),true)}
+function renderOverviewPods(){const root=$('overviewPods');root.replaceChildren();const rows=podRows();rows.slice(0,3).forEach(p=>{const row=el('button','compact-row');row.style.width='100%';row.style.border='0';row.style.borderBottom='1px solid var(--line)';row.style.background='transparent';row.style.color='inherit';row.style.textAlign='left';const copy=el('div');copy.append(el('strong','',p.id),el('span','',p.fetch+' fetches · '+p.tunnel+' tunnels · last used '+timeAgo(p.last)));row.append(copy,el('span','compact-value',p.issues?p.issues+' issues':'Healthy'));row.addEventListener('click',()=>{app.selectedPod=p.id;renderEvents();renderLive();$('clearPodFilter').classList.remove('hidden');activateTab('activity')});root.append(row)});if(!rows.length)root.append(el('div','empty','No pod activity in this range.'))}
+function outcomeLabel(value){return value.split('-').join(' ')}
+function renderEvents(){const root=$('events');root.replaceChildren();const head=el('div','events-head');['Time','Pod','Mode','Target','Outcome','Data'].forEach(x=>head.append(el('span','',x)));root.append(head);const rows=scopedEvents();rows.forEach(e=>{const row=el('article','event');row.tabIndex=0;row.setAttribute('aria-label',e.mode+' to '+e.host+', '+outcomeLabel(e.outcome));row.append(el('span','event-time',timeAgo(e.at)),el('span','pod-chip',e.podId||'Unknown pod'),el('span','mode-chip '+e.mode,e.mode));const target=el('div','target');target.append(el('strong','',e.target),el('span','',e.status?'HTTP '+e.status:'No HTTP status'));row.append(target);const outcomeClass=e.outcome==='ok'?'outcome':e.outcome.includes('blocked')?'outcome blocked':'outcome bad';row.append(el('span',outcomeClass,outcomeLabel(e.outcome)),el('span','bytes',e.mode==='tunnel'?fmtBytes((e.bytesUp||0)+(e.bytesDown||0)):'—'));const detail=el('div','event-detail');[['Started',new Date(e.at).toLocaleString()],['Duration',fmtDuration(e.ms)],['Session',e.session?'Signed in as you':'Clean / no cookies'],['Reason',e.reason||'Completed normally']].forEach(x=>{const item=el('div','detail-item');item.append(el('b','',x[0]),el('span','',x[1]));detail.append(item)});row.append(detail);const toggle=()=>row.classList.toggle('open');row.addEventListener('click',toggle);row.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();toggle()}});root.append(row)});if(!rows.length){root.replaceChildren(el('div','empty','No activity matches these filters.'));}$('clearPodFilter').classList.toggle('hidden',!app.selectedPod);if(app.activityView==='events')$('activityCopy').textContent=rows.length+' event'+(rows.length===1?'':'s')+(app.selectedPod?' from '+app.selectedPod:'')+' · detailed history stored locally'}
+function renderSites(){const root=$('sites');root.replaceChildren();const map=new Map();allRangeEvents().forEach(e=>{const s=map.get(e.host)||{host:e.host,count:0,issues:0,bytes:0};s.count++;s.issues+=e.outcome==='ok'?0:1;s.bytes+=(e.bytesUp||0)+(e.bytesDown||0);map.set(e.host,s)});[...map.values()].sort((a,b)=>b.count-a.count).slice(0,7).forEach(s=>{const row=el('div','site-row');const blocked=app.data.blockedSites.includes(s.host);const control=el('button','btn small'+(blocked?' danger':''),blocked?'Unblock':'Block');control.disabled=readOnly;control.addEventListener('click',async()=>{if(!confirm((blocked?'Unblock ':'Block ')+s.host+(blocked?'?':' for every pod?')))return;try{await mutate('site',{domain:s.host,blocked:!blocked});toast((blocked?'Unblocked ':'Blocked ')+s.host)}catch(error){toast(error.message)}});row.append(el('b','',s.host),el('span','',s.count+' event'+(s.count===1?'':'s')),el('span','',s.issues?s.issues+' issue'+(s.issues===1?'':'s'):'Healthy'),control);root.append(row)})}
+function renderSettings(){const signed=$('signedSites');signed.replaceChildren();app.data.signedInSites.forEach(s=>{const b=el('button','tag signed',s+' ×');b.disabled=readOnly;b.title='Revoke signed-in use for '+s;b.addEventListener('click',async()=>{if(!confirm('Revoke signed-in access for '+s+'? Clean access will remain available.'))return;try{await mutate('revoke-session',{domain:s});toast('Revoked signed-in access for '+s)}catch(error){toast(error.message)}});signed.append(b)});if(!signed.children.length)signed.append(el('span','tag','None'));const blocked=$('blockedSites');blocked.replaceChildren();app.data.blockedSites.forEach(s=>{const b=el('button','tag blocked',s+' ×');b.disabled=readOnly;b.title='Unblock '+s;b.addEventListener('click',async()=>{try{await mutate('site',{domain:s,blocked:false});toast('Unblocked '+s)}catch(error){toast(error.message)}});blocked.append(b)});if(!blocked.children.length)blocked.append(el('span','tag','None'));$('retention').value=String(app.data.retentionDays);$('retention').disabled=readOnly;$('storageCopy').textContent=app.data.retentionDays+' days · '+fmtBytes(app.data.storageBytes)+' on disk';$('storagePath').textContent=app.data.storagePath}
+function renderBadges(){const issues=allRangeEvents().filter(e=>e.outcome!=='ok').length;$('activityBadge').textContent=String(issues);$('activityBadge').classList.toggle('hidden',issues===0);$('podsBadge').textContent=String(podRows().length);const controls=app.data.blockedSites.length+app.data.pausedPods.length;$('controlsBadge').textContent=String(controls);$('controlsBadge').classList.toggle('hidden',controls===0)}
+function renderAll(){renderState();renderMetrics();renderAttention();renderChart();renderPods();renderOverviewPods();renderLive();renderEvents();renderSites();renderSettings();renderBadges();activateActivityView(app.activityView)}
+async function refresh(){app.data=await fetch(apiBase+'/data').then(r=>r.json());$('previewRibbon').classList.toggle('hidden',!app.data.preview);$('updated').textContent='Updated '+timeAgo(app.data.updatedAt);renderAll()}
+async function load(){await refresh();activateTab(location.hash.slice(1)||'overview',false)}
+$('range').addEventListener('change',renderAll);$('modeFilter').addEventListener('change',e=>{app.mode=e.target.value;renderEvents()});$('outcomeFilter').addEventListener('change',e=>{app.outcome=e.target.value;renderEvents()});$('siteFilter').addEventListener('input',e=>{app.site=e.target.value.trim().toLowerCase();renderEvents()});$('retention').addEventListener('change',async e=>{try{await mutate('retention',{days:Number(e.target.value)});toast('Keeping '+e.target.value+' days of activity')}catch(error){toast(error.message);renderSettings()}});
+document.addEventListener('click',async e=>{const tab=e.target.closest('[data-tab]');if(tab){activateTab(tab.dataset.tab);return}const jump=e.target.closest('[data-tab-jump]');if(jump){activateTab(jump.dataset.tabJump);return}const activityView=e.target.closest('[data-activity-view]');if(activityView){activateActivityView(activityView.dataset.activityView);return}const b=e.target.closest('[data-action]');if(!b)return;const action=b.dataset.action;if(action==='clear-pod'){app.selectedPod=null;renderAll()}if(action==='review-issues'){app.outcome='issue';$('outcomeFilter').value='issue';activateActivityView('events');renderEvents();activateTab('activity')}if(action==='stop'&&confirm('Stop the relay for every pod? Saved history will remain available.')){try{await mutate('stop');app.stopped=true;renderState();toast('Relay stopping')}catch(error){toast(error.message)}}if(action==='copy-url'){navigator.clipboard?.writeText(location.href);toast('Local URL copied')}if(action==='export'){location.href=apiBase+'/export'}if(action==='clear-history'&&confirm('Clear all retained relay activity? Pairing, sessions, and access rules will stay unchanged.')){try{await mutate('clear-history');toast('Local relay history cleared')}catch(error){toast(error.message)}}});
+document.querySelector('.tab-list').addEventListener('keydown',e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;const tabs=[...document.querySelectorAll('[data-tab]')];let index=tabs.indexOf(document.activeElement);if(e.key==='Home')index=0;else if(e.key==='End')index=tabs.length-1;else index=(index+(e.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;e.preventDefault();tabs[index].focus();activateTab(tabs[index].dataset.tab)});
+window.addEventListener('popstate',()=>activateTab(location.hash.slice(1)||'overview',false));
+load();setInterval(()=>{if(app.data)refresh().catch(()=>undefined)},2000);
+</script>
+</body></html>`;
+
+export interface DashboardActions {
+  stop?(): void | Promise<void>;
+  revokeSession?(domain: string): void | Promise<void>;
+}
+
+export interface DashboardOptions {
+  preview?: boolean;
+  fixture?: DashboardFixture;
+  readOnly?: boolean;
+  store?: RelayEventStore;
+  runtime?: RelayRuntime;
+  config?: () => RelayConfig;
+  actions?: DashboardActions;
+  routeToken?: string;
+  csrfToken?: string;
+}
+
+function pageFor(base: string, csrf: string, readOnly: boolean): string {
+  return PAGE
+    .replace("__API_BASE__", base)
+    .replace("__CSRF__", csrf)
+    .replace("__READ_ONLY__", String(readOnly));
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 16_384) { reject(new Error("request too large")); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<string, unknown>); }
+      catch { reject(new Error("invalid JSON")); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function response(res: ServerResponse, status: number, value: unknown): void {
+  res.writeHead(status, { ...SECURITY_HEADERS, "cache-control": "no-store", "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(value));
+}
+
+export function serveDashboard(
+  port = 7373,
+  options: DashboardOptions = {},
+): Promise<{ url: string; close: () => void; routeToken: string; csrfToken: string }> {
+  return new Promise((resolve, reject) => {
+    const routeToken = options.routeToken ?? randomBytes(32).toString("hex");
+    const csrfToken = options.csrfToken ?? randomBytes(32).toString("hex");
+    const base = options.preview ? "" : `/${routeToken}`;
+    const store = options.store ?? (options.preview ? undefined : new LocalEventStore({ retentionDays: load().retentionDays }).init());
+    const runtime = options.runtime ?? new RelayRuntime({ daemon: "stopped" });
+    const config = options.config ?? load;
+    const readOnly = options.readOnly ?? (!options.preview && runtime.snapshot().daemon === "stopped");
+    let origin = "";
     const server = createServer((req, res) => {
-      if (req.url === "/data") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(readSummary()));
+      void (async () => {
+        try {
+          const host = req.headers.host ?? "";
+          const expectedPort = new URL(origin || "http://127.0.0.1").port;
+          const allowedHosts = new Set([`127.0.0.1:${expectedPort}`, `localhost:${expectedPort}`, `[::1]:${expectedPort}`]);
+          if (origin && !allowedHosts.has(host)) return response(res, 400, { error: "unexpected Host" });
+          const pathname = new URL(req.url ?? "/", origin || "http://127.0.0.1").pathname.replace(/\/$/, "") || "/";
+          if (pathname === `${base}/data`) {
+            return json(res, options.preview ? fixtureData(options.fixture ?? "active") : currentData(store!, runtime.snapshot(), config()));
+          }
+          if (pathname === `${base}/export` && req.method === "GET") {
+            res.writeHead(200, {
+              ...SECURITY_HEADERS,
+              "cache-control": "no-store",
+              "content-type": "application/json; charset=utf-8",
+              "content-disposition": `attachment; filename="podbay-relay-events-${new Date().toISOString().slice(0, 10)}.json"`,
+            });
+            res.end(options.preview ? JSON.stringify(fixtureData(options.fixture ?? "active").events, null, 2) : store!.exportJson());
+            return;
+          }
+          if (pathname.startsWith(`${base}/actions/`)) {
+            if (readOnly) return response(res, 404, { error: "controls are unavailable while the relay is stopped" });
+            if (req.method !== "POST") return response(res, 405, { error: "POST required" });
+            if (req.headers["content-type"] !== "application/json") return response(res, 415, { error: "application/json required" });
+            if (req.headers.origin !== origin) return response(res, 403, { error: "same-origin request required" });
+            if (req.headers["x-csrf-token"] !== csrfToken) return response(res, 403, { error: "invalid CSRF token" });
+            const body = await readJson(req);
+            const action = pathname.slice(`${base}/actions/`.length);
+            if (options.preview) {
+              return response(res, 200, { ok: true, simulated: true });
+            } else if (action === "pod" && typeof body.podId === "string" && typeof body.paused === "boolean") {
+              setPodPaused(body.podId, body.paused);
+            } else if (action === "site" && typeof body.domain === "string" && typeof body.blocked === "boolean") {
+              setDomainBlocked(body.domain, body.blocked);
+            } else if (action === "retention" && typeof body.days === "number") {
+              setRetentionDays(body.days);
+              store!.setRetentionDays(body.days as 7 | 30 | 90);
+              store!.prune(true);
+              store!.reload();
+            } else if (action === "clear-history") {
+              store!.clear();
+            } else if (action === "revoke-session" && typeof body.domain === "string" && options.actions?.revokeSession) {
+              await options.actions.revokeSession(body.domain);
+            } else if (action === "stop" && options.actions?.stop) {
+              await options.actions.stop();
+            } else {
+              return response(res, 400, { error: "invalid action or body" });
+            }
+            return response(res, 200, { ok: true });
+          }
+          if (pathname !== (base || "/")) return response(res, 404, { error: "not found" });
+          res.writeHead(200, { ...SECURITY_HEADERS, "cache-control": "no-store", "content-type": "text/html; charset=utf-8" });
+          res.end(pageFor(base, csrfToken, readOnly));
+        } catch (error) {
+          if (!res.headersSent) response(res, 500, { error: "dashboard request failed" });
+          else res.end();
+        }
+      })();
+    });
+    let retried = false;
+    const listen = (candidate: number) => server.listen(candidate, "127.0.0.1");
+    server.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE" && !retried && port !== 0) {
+        retried = true;
+        server.close(() => listen(0));
         return;
       }
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(PAGE);
+      reject(error);
     });
-    // Bind to loopback ONLY — the dashboard shows the owner's fetch history and must
-    // not be reachable from the network.
-    server.listen(port, "127.0.0.1", () => {
-      resolve({ url: `http://127.0.0.1:${port}`, close: () => server.close() });
+    server.on("listening", () => {
+      const address = server.address();
+      const actualPort = typeof address === "object" && address ? address.port : port;
+      origin = `http://127.0.0.1:${actualPort}`;
+      resolve({ url: `${origin}${base || ""}`, close: () => server.close(), routeToken, csrfToken });
     });
+    listen(port);
   });
 }

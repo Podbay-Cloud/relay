@@ -4,7 +4,7 @@ import { RelayClient, publicHostOf } from "../src/relay-client.js";
 let sent: Record<string, unknown>[];
 const socket = { send: (j: string) => sent.push(JSON.parse(j)) };
 const okFetch = async () => ({ status: 200, body: "PAGE", finalUrl: "https://reddit.com/x" });
-const m = (id: string, url: string) => JSON.stringify({ type: "fetch", id, url });
+const m = (id: string, url: string, podId?: string) => JSON.stringify({ type: "fetch", id, url, ...(podId ? { source: { podId } } : {}) });
 beforeEach(() => (sent = []));
 
 describe("the relay serves the public web freely — no per-request approval", () => {
@@ -63,6 +63,29 @@ describe("capacity: queue, do not refuse", () => {
     await c.onMessage(m("j1", "https://reddit.com/x"));
     await c.onMessage(m("j2", "http://10.0.0.1/"));
     expect(audits).toHaveLength(2);
-    expect(audits[1]).toMatchObject({ error: expect.stringMatching(/refused/) });
+    expect(audits[1]).toMatchObject({ outcome: "safety-blocked", reason: expect.stringMatching(/refused/) });
+  });
+
+  it("retains gateway source and distinct site outcomes without query secrets", async () => {
+    const audits: Record<string, unknown>[] = [];
+    const c = new RelayClient(socket, async () => ({ status: 429, body: "slow", finalUrl: "https://example.com/final?token=two#x", session: true }), { audit: (e) => audits.push(e) });
+    await c.onMessage(m("j1", "https://user:pass@example.com/start?secret=one#x", "pod-a"));
+    expect(audits[0]).toMatchObject({ source: { podId: "pod-a" }, outcome: "rate-limited", target: "https://example.com/start", finalTarget: "https://example.com/final", httpStatus: 429, session: true });
+    expect(JSON.stringify(audits[0])).not.toMatch(/pass|secret|token=/);
+  });
+
+  it("enforces a pod/site denial before browser work while siblings remain eligible", async () => {
+    let calls = 0;
+    const audits: Record<string, unknown>[] = [];
+    const c = new RelayClient(socket, async () => { calls++; return okFetch(); }, {
+      deny: (source, host) => source && "podId" in source && source.podId === "paused" || host === "blocked.example" ? "blocked by relay owner" : undefined,
+      audit: (e) => audits.push(e),
+    });
+    await c.onMessage(m("a", "https://example.com/", "paused"));
+    await c.onMessage(m("b", "https://blocked.example/", "sibling"));
+    await c.onMessage(m("c", "https://example.com/", "sibling"));
+    expect(calls).toBe(1);
+    expect(sent.slice(0, 2).every((row) => String(row.error).includes("owner"))).toBe(true);
+    expect(audits.filter((row) => row.outcome === "owner-blocked")).toHaveLength(2);
   });
 });

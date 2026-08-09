@@ -3,11 +3,25 @@ import WebSocket from "ws";
 import { spawn } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { load, save, addLoginDomain, resetProfile, profileDir, pidFile, RelayConfig } from "./config.js";
+import {
+  load,
+  save,
+  addLoginDomain,
+  resetProfile,
+  profileDir,
+  pidFile,
+  dashboardRuntimeFile,
+  isDomainBlocked,
+  isPodPaused,
+  revokeLoginDomain,
+  RelayConfig,
+} from "./config.js";
 import { RelayClient } from "./relay-client.js";
+import { RelayTunnel } from "./relay-tunnel.js";
 import { BrowserFetcher } from "./browser-fetcher.js";
-import { record } from "./audit.js";
+import { RelayEventStore, type RelaySource } from "./audit.js";
 import { serveDashboard } from "./dashboard.js";
+import { RelayRuntime } from "./runtime.js";
 import { DISCLOSURE } from "./disclosure.js";
 import { c, rows } from "./colors.js";
 import { normalizeDomain } from "./domain.js";
@@ -32,6 +46,41 @@ function isRunning(): number | null {
   }
 }
 
+interface DashboardRuntimeRecord { pid: number; url: string; startedAt: string }
+
+function dashboardUrl(): string | null {
+  try {
+    const record = JSON.parse(readFileSync(dashboardRuntimeFile(), "utf8")) as DashboardRuntimeRecord;
+    process.kill(record.pid, 0);
+    const url = new URL(record.url);
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !/^\/[a-f0-9]{64}$/.test(url.pathname)) return null;
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function openBrowser(url: string): void {
+  const opener = process.platform === "darwin"
+    ? { command: "open", args: [url] }
+    : process.platform === "win32"
+      ? { command: "cmd", args: ["/c", "start", "", url] }
+      : { command: "xdg-open", args: [url] };
+  const child = spawn(opener.command, opener.args, { stdio: "ignore", detached: true });
+  child.on("error", () => log(`open this URL in a browser: ${url}`));
+  child.unref();
+}
+
+async function waitForDashboardUrl(timeoutMs = 2000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const url = dashboardUrl();
+    if (url) return url;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return null;
+}
+
 async function cmdStart(a: string[]): Promise<void> {
   if (a.includes("__daemon")) return runDaemon(a);
   if (isRunning()) die("a relay is already running (pb relay stop to stop it).");
@@ -50,6 +99,7 @@ async function cmdStart(a: string[]): Promise<void> {
   }
   cfg.gatewayUrl = gateway;
   save(cfg);
+  try { unlinkSync(dashboardRuntimeFile()); } catch {}
 
   // Spawn ourselves detached: one command, then it runs in the background.
   mkdirSync(profileDir().replace(/\/profile$/, ""), { recursive: true });
@@ -59,7 +109,8 @@ async function cmdStart(a: string[]): Promise<void> {
     stdio: "ignore",
   });
   child.unref();
-  writeFileSync(pidFile(), String(child.pid));
+  writeFileSync(pidFile(), String(child.pid), { mode: 0o600 });
+  const commandCenter = await waitForDashboardUrl();
   log("");
   log(`  ${c.green(c.bold("✓ relay running"))} ${c.dim(`(pid ${child.pid}, in the background)`)}`);
   log("");
@@ -70,6 +121,7 @@ async function cmdStart(a: string[]): Promise<void> {
       ["pb relay stop", "stop it"],
     ]),
   );
+  if (commandCenter) log(`\n  ${c.dim("command center")}  ${c.cyan(commandCenter)}`);
   log("");
 }
 
@@ -81,7 +133,40 @@ async function runDaemon(a: string[]): Promise<void> {
     // Re-read config each fetch: `pb relay login` writes there and we pick it up live.
     isSessionDomain: (host) => load().loginDomains.some((d) => host === d || host.endsWith(`.${d}`)),
   });
+  const cfgAtStart = load();
+  const store = new RelayEventStore({ retentionDays: cfgAtStart.retentionDays ?? 30 }).init();
+  const runtime = new RelayRuntime({ version: "0.1.7" });
   let stopping = false;
+  let dashboardClose: (() => void) | undefined;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    runtime.clearActive();
+    dashboardClose?.();
+    await browser.close();
+    try { unlinkSync(pidFile()); } catch {}
+    try { unlinkSync(dashboardRuntimeFile()); } catch {}
+    process.exit(0);
+  };
+  try {
+    const dashboard = await serveDashboard(7373, {
+      store,
+      runtime,
+      config: load,
+      actions: {
+        stop: () => { setTimeout(() => void stop(), 25); },
+        revokeSession: async (domain) => {
+          revokeLoginDomain(domain);
+          await browser.revokeDomain(domain).catch(() => undefined);
+        },
+      },
+    });
+    dashboardClose = dashboard.close;
+    mkdirSync(profileDir().replace(/\/profile$/, ""), { recursive: true, mode: 0o700 });
+    writeFileSync(dashboardRuntimeFile(), JSON.stringify({ pid: process.pid, url: dashboard.url, startedAt: new Date().toISOString() }), { mode: 0o600 });
+  } catch {
+    // Oversight UI is best-effort: it must never prevent the relay transport starting.
+  }
   let backoff = 1000;
   // Prefer a stored reconnect token (survives restarts/blips) over the one-time code,
   // which is spent the instant the first pairing succeeds.
@@ -92,8 +177,28 @@ async function runDaemon(a: string[]): Promise<void> {
     // A token reconnects; the code is only for the very first pairing.
     const auth = token ? `token=${encodeURIComponent(token)}` : `code=${encodeURIComponent(code)}`;
     const ws = new WebSocket(`${base}/relay?${auth}`);
-    const client = new RelayClient({ send: (j) => { try { ws.send(j); } catch { /* closing */ } } }, browser.fetch, { audit: record });
-    ws.on("open", () => { backoff = 1000; });
+    const sink = { send: (j: string) => { try { ws.send(j); } catch { /* closing */ } } };
+    const deny = (source: RelaySource | undefined, host: string): string | undefined => {
+      const cfg = load();
+      if (source && "podId" in source && isPodPaused(cfg, source.podId)) return `pod ${source.podId} is paused by the relay owner`;
+      if (isDomainBlocked(cfg, host)) return `${host} is blocked by the relay owner`;
+      return undefined;
+    };
+    const client = new RelayClient(sink, browser.fetch, { audit: (event) => store.append(event), runtime, deny });
+    // The SAME relay also serves the egress tunnel: the pod's apps connect through here
+    // and egress from this machine. One `pb relay start`, both consumers.
+    const tunnel = new RelayTunnel(sink, {
+      // Tunnel connections land in the SAME local audit as fetches, so `pb relay
+      // dashboard` shows one history: host, whether it was allowed, and why not.
+      audit: (event) => { store.append(event); },
+      runtime,
+      deny,
+    });
+    ws.on("open", () => {
+      backoff = 1000;
+      runtime.setGateway("connected");
+      sink.send(JSON.stringify({ type: "relay-online", loginDomains: load().loginDomains }));
+    });
     ws.on("message", (d) => {
       const raw = String(d);
       // The gateway hands us a durable reconnect token at pairing — persist it so every
@@ -106,12 +211,21 @@ async function runDaemon(a: string[]): Promise<void> {
           cfg.reconnectToken = token;
           save(cfg);
         }
+        // Tunnel frames are handled here, not by the fetch client.
+        if (m.type?.startsWith("tunnel-")) {
+          tunnel.handle(m as Parameters<typeof tunnel.handle>[0]);
+          return;
+        }
       } catch { /* not our frame */ }
       void client.onMessage(raw);
     });
     ws.on("error", () => {});
     ws.on("close", (c) => {
+      // The link is gone — no stream can be served, so close them all rather than
+      // leaving the pod's apps hanging.
+      tunnel.closeAll();
       if (stopping) return;
+      runtime.setGateway(c === 4401 ? "unavailable" : "reconnecting");
       // 4401 = the credential was rejected. If we were using a token that expired/was
       // revoked, fall back to the code ONCE (re-pair); if the code itself is rejected,
       // give up — retrying is pointless.
@@ -126,7 +240,6 @@ async function runDaemon(a: string[]): Promise<void> {
     });
   };
 
-  const stop = async () => { stopping = true; await browser.close(); try { unlinkSync(pidFile()); } catch {} process.exit(0); };
   process.on("SIGTERM", () => void stop());
   process.on("SIGINT", () => void stop());
   connect();
@@ -142,48 +255,83 @@ async function cmdLogin(a: string[]): Promise<void> {
   const first = await ctx.newPage();
   await first.goto(`https://${domain}`, { waitUntil: "domcontentloaded" }).catch(() => undefined);
   log("");
-  log(`  ${c.bold("sign in")} ${c.dim("(2FA included), then just close the browser window.")}`);
-  log(`  ${c.dim("I'll save the session and quit the browser for you — no need to Cmd+Q.")}`);
+  log(`  ${c.bold("sign in")} ${c.dim("(2FA included), then close the browser —")} ${c.bold("or press Enter here")} ${c.dim("when done.")}`);
+  log(`  ${c.dim("I'll save the session and quit the browser for you.")}`);
 
-  // Wait until the owner closes the window — i.e. the context has no pages left.
-  // ctx.on("close") does NOT fire when the window is closed but Chrome stays running
-  // (macOS keeps the app alive), which used to leave this hanging AND the profile
-  // locked so the daemon's session fetches failed. Track pages instead.
+  // Wait until the owner is done. Belt-and-suspenders so it CANNOT hang (live-caught
+  // 2026-08-03: closing tabs left Chrome alive with a lingering page, so pages()===0
+  // never fired and the CLI hung). We resolve on ANY of: all pages closed, the browser
+  // disconnecting, OR the owner pressing Enter — whichever comes first.
   await new Promise<void>((resolve) => {
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
+      clearInterval(poll);
+      process.stdin.off("data", onEnter);
+      process.stdin.pause();
       resolve();
     };
-    const check = () => {
-      // Defer so the closing page is already out of ctx.pages().
-      setTimeout(() => {
-        if (ctx.pages().length === 0) finish();
-      }, 100);
-    };
+    const closedNow = () => ctx.pages().length === 0;
+    const check = () => setTimeout(() => closedNow() && finish(), 100);
     ctx.on("close", finish);
     ctx.on("page", (p) => p.on("close", check));
-    first.on("close", check);
+    for (const p of ctx.pages()) p.on("close", check);
+    // Chrome fully quit / crashed — a hard "window is gone" signal the page events miss.
+    (ctx as unknown as { browser?(): { on(e: string, f: () => void): void } | null }).browser?.()?.on?.("disconnected", finish);
+    // Fallback poll — catches tab-close semantics the events miss, and a context that
+    // has become unusable (throwing = gone).
+    const poll = setInterval(() => {
+      try { if (closedNow()) finish(); } catch { finish(); }
+    }, 1000);
+    // Manual escape hatch — the owner is never stuck if auto-detect misses their close.
+    const onEnter = () => finish();
+    process.stdin.resume();
+    process.stdin.once("data", onEnter);
   });
+
+  // Did a session actually land? Read cookies for the domain BEFORE closing, so "saved"
+  // isn't a lie when the sign-in never completed (owner's doubt, 2026-08-03).
+  let hasSession = false;
+  try {
+    const cookies = await ctx.cookies(`https://${domain}`).catch(() => [] as unknown[]);
+    hasSession = Array.isArray(cookies) && cookies.length > 0;
+  } catch { /* context already gone — can't verify, don't overclaim */ }
 
   // Fully close the context → quits the Chrome the relay launched → releases the
   // profile lock so the daemon can open it for session fetches.
   await ctx.close().catch(() => undefined);
   addLoginDomain(domain);
   log("");
-  log(`  ${c.green("✓ saved")} ${c.dim(`— ${domain} will now be fetched as you; every other site stays clean.`)}`);
+  if (hasSession) {
+    log(`  ${c.green("✓ signed in")} ${c.dim(`— ${domain} will now be fetched as you; every other site stays clean.`)}`);
+  } else {
+    log(`  ${c.yellow("⚠ saved, but I didn't see a session")} ${c.dim(`for ${domain}. If a fetch hits a login wall, run`)} ${c.bold(`pb relay login ${domain}`)} ${c.dim("again and complete the sign-in.")}`);
+  }
   log("");
 }
 
 async function cmdDashboard(a: string[]): Promise<void> {
   const port = Number(arg(a, "--port") ?? 7373);
-  const { url } = await serveDashboard(port);
+  const preview = a.includes("--preview");
+  if (!preview) {
+    const liveUrl = dashboardUrl();
+    if (liveUrl) {
+      log(`relay command center: ${liveUrl}`);
+      log("(served by the running relay — detailed history stays on this computer.)");
+      openBrowser(liveUrl);
+      return;
+    }
+  }
+  const cfg = load();
+  const store = preview ? undefined : new RelayEventStore({ retentionDays: cfg.retentionDays ?? 30 }).init();
+  const runtime = preview ? undefined : new RelayRuntime({ daemon: "stopped" });
+  const { url } = await serveDashboard(port, { preview, store, runtime, readOnly: !preview });
   log(`relay dashboard: ${url}`);
-  log("(local only — shows what your relay has fetched. Ctrl-C to close.)");
-  // Best-effort open in the browser.
-  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  spawn(opener, [url], { stdio: "ignore", detached: true }).unref();
+  log(preview
+    ? "(UX preview — sample multi-pod activity; controls are simulated. Ctrl-C to close.)"
+    : "(relay stopped — read-only saved history; local to this computer. Ctrl-C to close.)");
+  openBrowser(url);
   await new Promise(() => {}); // stay up until Ctrl-C
 }
 
@@ -194,6 +342,7 @@ function cmdStatus(): void {
   log("");
   log(`${label("relay")}${pid ? c.green(`running`) + c.dim(` (pid ${pid})`) : c.yellow("not running")}`);
   log(`${label("gateway")}${cfg.gatewayUrl ? c.cyan(cfg.gatewayUrl) : c.dim("(unset)")}`);
+  log(`${label("dashboard")}${dashboardUrl() ? c.cyan(dashboardUrl()!) : c.dim("pb relay dashboard opens saved history")}`);
   log(
     `${label("as-you")}${
       cfg.loginDomains.length ? cfg.loginDomains.join(", ") : c.dim("no sites signed in — all fetches are clean")

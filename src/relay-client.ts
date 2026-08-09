@@ -19,6 +19,14 @@
  * Pure over injected effects (fetcher, audit) so the decisions test without a browser.
  */
 
+import {
+  fetchOutcome,
+  safeFetchTarget,
+  type RelayEventV2,
+  type RelaySource,
+} from "./audit.js";
+import type { RelayRuntime } from "./runtime.js";
+
 export interface RelaySocket {
   send(json: string): void;
 }
@@ -26,6 +34,7 @@ export interface RelaySocket {
 export interface FetchJob {
   id: string;
   url: string;
+  source?: RelaySource;
 }
 
 export interface FetchOutput {
@@ -39,7 +48,7 @@ export interface FetchOutput {
 }
 
 export type Fetcher = (job: FetchJob) => Promise<FetchOutput>;
-export type AuditFn = (entry: { host: string; status: number; ms: number; session: boolean; error?: string }) => void;
+export type AuditFn = (entry: RelayEventV2) => void;
 
 /** Host of a URL, or null if it is not a public web host the relay may fetch. */
 export function publicHostOf(url: string): string | null {
@@ -67,6 +76,10 @@ interface Opts {
   maxConcurrent?: number;
   queueMax?: number;
   audit?: AuditFn;
+  runtime?: RelayRuntime;
+  /** Return a refusal reason before any browser work, or undefined to allow. */
+  deny?: (source: RelaySource | undefined, host: string) => string | undefined;
+  now?: () => number;
 }
 
 export class RelayClient {
@@ -84,7 +97,7 @@ export class RelayClient {
   }
 
   async onMessage(raw: string): Promise<void> {
-    let msg: { type?: string; id?: string; url?: string };
+    let msg: { type?: string; id?: string; url?: string; source?: RelaySource };
     try {
       msg = JSON.parse(raw);
     } catch {
@@ -92,11 +105,20 @@ export class RelayClient {
     }
     if (msg.type !== "fetch" || !msg.id || !msg.url) return;
 
+    const safe = safeFetchTarget(msg.url);
     const host = publicHostOf(msg.url);
-    if (!host) {
+    if (!safe || !host) {
       // The one thing we refuse rather than serve: a non-public / private target.
-      this.opts.audit?.({ host: msg.url.slice(0, 60), status: 0, ms: 0, session: false, error: "refused: not a public web URL" });
+      const auditSafe = safe ?? safeFetchTarget("https://invalid.invalid/")!;
+      this.audit({ id: msg.id, url: auditSafe.target, source: msg.source }, auditSafe, "safety-blocked", 0, false, "refused: not a public web URL");
       this.reply(msg.id, { status: 0, body: "", error: "the relay only fetches public web addresses" });
+      return;
+    }
+
+    const denial = this.opts.deny?.(msg.source, host);
+    if (denial) {
+      this.audit({ id: msg.id, url: safe.target, source: msg.source }, safe, "owner-blocked", 0, false, denial);
+      this.reply(msg.id, { status: 0, body: "", error: denial });
       return;
     }
 
@@ -105,34 +127,75 @@ export class RelayClient {
         this.reply(msg.id, { status: 0, body: "", error: "relay busy — queue full" });
         return;
       }
-      this.queue.push({ id: msg.id, url: msg.url });
+      this.queue.push({ id: msg.id, url: msg.url, source: msg.source });
       return;
     }
-    void this.run({ id: msg.id, url: msg.url }, host);
+    void this.run({ id: msg.id, url: msg.url, source: msg.source }, host, safe);
   }
 
-  private async run(job: FetchJob, host: string): Promise<void> {
+  private now(): number { return (this.opts.now ?? Date.now)(); }
+
+  private audit(
+    job: FetchJob,
+    safe: { target: string; host: string },
+    outcome: RelayEventV2["outcome"],
+    started: number,
+    session: boolean,
+    reason?: string,
+    status?: number,
+    finalTarget?: string,
+  ): void {
+    const finished = this.now();
+    this.opts.audit?.({
+      v: 2,
+      id: `fetch-${job.id}`,
+      startedAt: new Date(started || finished).toISOString(),
+      finishedAt: new Date(finished).toISOString(),
+      durationMs: started ? Math.max(0, finished - started) : 0,
+      source: job.source,
+      mode: "fetch",
+      outcome,
+      target: safe.target,
+      ...(finalTarget ? { finalTarget } : {}),
+      host: safe.host,
+      ...(status !== undefined ? { httpStatus: status } : {}),
+      session,
+      ...(reason ? { reason } : {}),
+    });
+  }
+
+  private async run(job: FetchJob, host: string, safe = safeFetchTarget(job.url)!): Promise<void> {
+    const denial = this.opts.deny?.(job.source, host);
+    if (denial) {
+      this.audit(job, safe, "owner-blocked", 0, false, denial);
+      this.reply(job.id, { status: 0, body: "", error: denial });
+      return;
+    }
     this.active++;
-    const started = Date.now();
+    const started = this.now();
+    this.opts.runtime?.begin({ id: job.id, source: job.source, mode: "fetch", target: safe.target, startedAt: new Date(started).toISOString() });
     try {
       const out = await this.fetcher(job);
       // A redirect that landed on a private target is the same SSRF, after the fact.
       if (out.finalUrl && !publicHostOf(out.finalUrl)) {
         this.reply(job.id, { status: 0, body: "", error: "redirected to a non-public address" });
-        this.opts.audit?.({ host, status: 0, ms: Date.now() - started, session: !!out.session, error: "redirect to private" });
+        this.audit(job, safe, "safety-blocked", started, !!out.session, "redirect to private");
         return;
       }
       this.reply(job.id, out);
-      this.opts.audit?.({ host, status: out.status, ms: Date.now() - started, session: !!out.session, error: out.error });
+      const final = out.finalUrl ? safeFetchTarget(out.finalUrl)?.target : undefined;
+      this.audit(job, safe, fetchOutcome(out.status, out.error), started, !!out.session, out.error, out.status, final);
     } catch (e) {
       this.reply(job.id, { status: 0, body: "", error: String(e) });
-      this.opts.audit?.({ host, status: 0, ms: Date.now() - started, session: false, error: String(e) });
+      this.audit(job, safe, "network-error", started, false, String(e), 0);
     } finally {
+      this.opts.runtime?.finish(job.id);
       this.active--;
       const next = this.queue.shift();
       if (next) {
         const h = publicHostOf(next.url);
-        if (h) void this.run(next, h);
+        const nextSafe = safeFetchTarget(next.url);
+        if (h && nextSafe) void this.run(next, h, nextSafe);
       }
     }
   }

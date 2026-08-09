@@ -17,6 +17,9 @@ export interface BrowserOptions {
   profileDir: string;
   channel?: string;
   navTimeoutMs?: number;
+  /** Hard ceiling on a WHOLE fetch (launch + nav + read). A browser that stalls past
+   * this is aborted and torn down so it can't hang the relay — see `fetch`. */
+  fetchDeadlineMs?: number;
   recycleAfter?: number;
   headless?: boolean;
   /** Does this host use the owner's signed-in session? Read from config per fetch. */
@@ -33,6 +36,7 @@ interface Page {
 interface Context {
   newPage(): Promise<Page>;
   close(): Promise<void>;
+  clearCookies(options?: { domain?: string | RegExp }): Promise<void>;
 }
 
 function hostOf(url: string): string {
@@ -91,13 +95,38 @@ export class BrowserFetcher {
     return this.browser.newContext({ viewport: { width: 1440, height: 900 } });
   }
 
+  /**
+   * WATCHDOG: a fetch that stalls (a site refusing a headless browser, a hung context,
+   * a wedged persistent profile) must NEVER hang the relay — that was the whole
+   * "relay running but nothing comes back" failure (live-caught on reddit, 2026-08-03).
+   * The nav timeout only bounds `goto`; launch, `content()`, and context creation could
+   * hang unbounded. So the whole fetch races a hard deadline, and on a blown deadline we
+   * TEAR DOWN the browser so the NEXT fetch relaunches clean rather than inheriting a
+   * wedged one.
+   */
   readonly fetch: Fetcher = async (job: FetchJob): Promise<FetchOutput> => {
     const host = hostOf(job.url);
     const useSession = this.opts.isSessionDomain(host);
+    const deadlineMs = this.opts.fetchDeadlineMs ?? 25_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`relay fetch timed out after ${deadlineMs}ms`)), deadlineMs);
+    });
+    try {
+      return await Promise.race([this.doFetch(job, useSession), deadline]);
+    } catch (e) {
+      await this.resetBrowser(useSession); // a hung/errored browser must not poison the next fetch
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  private async doFetch(job: FetchJob, useSession: boolean): Promise<FetchOutput> {
     const ctx = useSession ? await this.sessionCtx() : await this.cleanCtx();
     const page = await ctx.newPage();
     try {
-      const res = await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs ?? 35_000 });
+      const res = await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs ?? 20_000 });
       await page.waitForTimeout(1500);
       const out: FetchOutput = { status: res?.status() ?? 0, body: await page.content(), finalUrl: page.url(), session: useSession };
       this.served++;
@@ -114,7 +143,28 @@ export class BrowserFetcher {
         await b.close().catch(() => undefined);
       }
     }
-  };
+  }
+
+  /** Drop the wedged context so the next fetch launches a fresh one. */
+  private async resetBrowser(useSession: boolean): Promise<void> {
+    if (useSession) {
+      const s = this.session;
+      this.session = null;
+      await (s as unknown as { close?(): Promise<void> })?.close?.().catch(() => undefined);
+    } else {
+      const b = this.browser;
+      this.browser = null;
+      this.served = 0;
+      await (b as unknown as { close?(): Promise<void> })?.close?.().catch(() => undefined);
+    }
+  }
+
+  /** Remove only one site's relay-profile cookies; clean contexts and siblings stay intact. */
+  async revokeDomain(domain: string): Promise<void> {
+    const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const ctx = await this.sessionCtx();
+    await ctx.clearCookies({ domain: new RegExp(`(^|\\.)${escaped}$`, "i") });
+  }
 
   async close(): Promise<void> {
     await this.session?.close().catch(() => undefined);

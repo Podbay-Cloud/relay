@@ -2,7 +2,17 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { load, save, resetProfile, profileDir } from "../src/config.js";
+import {
+  isDomainBlocked,
+  isPodPaused,
+  load,
+  profileDir,
+  resetProfile,
+  save,
+  setDomainBlocked,
+  setPodPaused,
+  setRetentionDays,
+} from "../src/config.js";
 
 let home: string;
 beforeEach(() => {
@@ -24,6 +34,29 @@ describe("relay config on the owner's machine", () => {
 
   it("returns empty login domains when nothing is saved", () => {
     expect(load().loginDomains).toEqual([]);
+    expect(load().pausedPodIds).toEqual([]);
+    expect(load().blockedDomains).toEqual([]);
+    expect(load().retentionDays).toBe(30);
+  });
+
+  it("fails closed to safe defaults when config is corrupt", () => {
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path.join(home, "config.json"), "{broken");
+    expect(load()).toMatchObject({ loginDomains: [], pausedPodIds: [], blockedDomains: [], retentionDays: 30 });
+  });
+
+  it("normalizes durable pod/site denials and retention choices", () => {
+    setPodPaused(" research-otter-7f2a ", true);
+    setDomainBlocked("Example.COM.", true);
+    setRetentionDays(90);
+    const cfg = load();
+    expect(isPodPaused(cfg, "research-otter-7f2a")).toBe(true);
+    expect(isDomainBlocked(cfg, "api.example.com")).toBe(true);
+    expect(cfg.retentionDays).toBe(90);
+    setPodPaused("research-otter-7f2a", false);
+    setDomainBlocked("example.com", false);
+    expect(load().pausedPodIds).toEqual([]);
+    expect(load().blockedDomains).toEqual([]);
   });
 
   it("writes the config file with owner-only permissions", () => {
