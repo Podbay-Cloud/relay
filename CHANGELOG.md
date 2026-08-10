@@ -3,6 +3,16 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.11
+
+- **Sites: filter by domain** — a search box on the Sites view. And each domain's "N events" and
+  "N issues" counts are now links: click to jump to Events filtered to that domain — issues in
+  amber, taking you straight to that site's problems.
+- **Events: pod names show in full** — no more truncation or wrapping in the events table.
+- **Cleaner header** — one relay-status indicator instead of three green dots. Dropped the
+  redundant "Live" pill and the static "Private to this computer" label (privacy is explained in
+  Controls); when the relay is stopped, the header now shows how fresh the saved history is.
+
 ## 0.1.10
 
 - **Leaner Overview** — removed the "Page fetch / Live tunnel" explainer cards; the page leads
