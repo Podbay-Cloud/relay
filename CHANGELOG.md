@@ -3,6 +3,19 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.8
+
+- **Relay dashboard, reworked for clarity.** The local dashboard now separates page fetches
+  from tunnel connections instead of merging them into one number, formats routed data
+  correctly (rolling up to GB with grouping), and shows a real activity-over-time trend with
+  an hourly axis and hover detail.
+- **One consolidated, always-visible activity filter bar.** Mode, outcome, pod, and site
+  filters sit together above the events table, each surfaced as a removable chip so it is
+  always clear what is being filtered — including when a pod filter was applied from another
+  view. Long history now loads incrementally instead of rendering every row at once.
+- **Pods are a filter, not a separate tab.** Pod attribution moved into the Activity filter;
+  per-pod pause/resume moved to Controls. All dropdowns are keyboard-accessible components.
+
 ## 0.1.7
 
 - **Relay concurrency ceiling is now legible.** `pb relay check` reports live capacity

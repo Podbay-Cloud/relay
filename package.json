@@ -1,6 +1,6 @@
 {
   "name": "@podbay/pb",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Podbay CLI. `pb relay` runs a fetch relay on your machine so a pod can read pages from your network, using sessions you sign into.",
   "type": "module",
   "bin": {

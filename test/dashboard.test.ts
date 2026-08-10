@@ -19,8 +19,11 @@ describe("relay dashboard preview", () => {
     expect(html).toContain("See what your pods");
     expect(html).toContain('role="tab"');
     expect(html).toContain('data-tab="activity"');
-    expect(html).toContain('data-tab="pods"');
     expect(html).toContain('data-tab="controls"');
+    // Pods is no longer a nav destination — it's folded into the Activity filter bar.
+    expect(html).not.toContain('data-tab="pods"');
+    expect(html).toContain('id="modeSeg"');
+    expect(html).toContain('id="podMount"');
     expect(html).toContain("Full detail stays here");
 
     const data = await fetch(`${dashboard.url}/data`).then((response) => response.json()) as {
