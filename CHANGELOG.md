@@ -3,6 +3,20 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.10
+
+- **Leaner Overview** — removed the "Page fetch / Live tunnel" explainer cards; the page leads
+  straight with your numbers.
+- **Sites is a proper domain aggregate** — it rolls up every domain for the range (not a handful)
+  with its own All | Signed-in toggle, and is no longer tied to the events filter bar (which belongs
+  to the Events view). "Signed-in" shows domains that had a signed-in fetch.
+- **"Pod activity" shows all pods** — the Overview shortcut clears any pod selection first.
+- **Clearer header** — the freshness pill reads "Live" while the relay is connected (and shows a
+  real "Updated …" time only when it's stopped), and "Private to this computer" spells out that
+  this detailed history never leaves your machine.
+- **Fixes** — pod names no longer wrap in the events table or the pod filter dropdown; an expanded
+  event row no longer collapses on the auto-refresh.
+
 ## 0.1.9
 
 - **Live and Events are separate tabs now.** "Live" shows only what's using your connection
