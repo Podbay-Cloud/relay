@@ -16,11 +16,14 @@ describe("relay dashboard preview", () => {
     const html = await page.text();
     expect(page.headers.get("x-frame-options")).toBe("DENY");
     expect(page.headers.get("access-control-allow-origin")).toBeNull();
-    expect(html).toContain("See what your pods");
+    expect(html).toContain("Podbay relay");
     expect(html).toContain('role="tab"');
-    expect(html).toContain('data-tab="activity"');
+    // Activity split into two tabs: Live (in-flight) + Events (audit + filters).
+    expect(html).toContain('data-tab="live"');
+    expect(html).toContain('data-tab="events"');
     expect(html).toContain('data-tab="controls"');
-    // Pods is no longer a nav destination — it's folded into the Activity filter bar.
+    expect(html).not.toContain('data-tab="activity"');
+    // Pods is not a nav destination — it's folded into the Events filter bar.
     expect(html).not.toContain('data-tab="pods"');
     expect(html).toContain('id="modeSeg"');
     expect(html).toContain('id="podMount"');

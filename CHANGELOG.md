@@ -3,6 +3,12 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.9
+
+- **Live and Events are separate tabs now.** "Live" shows only what's using your connection
+  right this second; "Events" is the full local audit with the filter bar. The Overview links to
+  each with its own quick card — Live now, Recent events, and Recent pods.
+
 ## 0.1.8
 
 - **Relay dashboard, reworked for clarity.** The local dashboard now separates page fetches

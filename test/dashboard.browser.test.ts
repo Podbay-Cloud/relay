@@ -32,8 +32,8 @@ async function fixture(name: DashboardFixture = "active") {
 describe.skipIf(!browser)("relay dashboard browser flows", () => {
   it("filters and expands activity, preserves tab URLs, and follows keyboard tab behavior", async () => {
     const page = await fixture();
-    await page.getByRole("tab", { name: /Activity/ }).click();
-    expect(new URL(page.url()).hash).toBe("#activity");
+    await page.locator("#tab-events").click();
+    expect(new URL(page.url()).hash).toBe("#events");
     // Outcome is a checkbox group now, not a native <select>. "Blocked" covers owner- and
     // safety-blocked; the active fixture has exactly one safety-blocked event.
     await page.locator('.check[data-k="blocked"]').click();
@@ -42,12 +42,12 @@ describe.skipIf(!browser)("relay dashboard browser flows", () => {
     expect(await page.locator('#activeFilters .filter-chip').first().textContent()).toContain("Blocked");
     await page.locator(".event").click();
     expect(await page.locator(".event-detail").isVisible()).toBe(true);
-    await page.getByRole("tab", { name: /Activity/ }).focus();
+    await page.locator("#tab-events").focus();
     await page.keyboard.press("ArrowRight");
     // WAIT for the hash rather than reading it straight after the keypress: the roving-tabindex
     // handler updates location asynchronously, so asserting immediately is a race the fast
-    // local headless shell wins and real Chrome (CI) loses. Pods is gone, so ArrowRight from
-    // Activity now lands on Controls.
+    // local headless shell wins and real Chrome (CI) loses. Tabs are Overview·Live·Events·Controls,
+    // so ArrowRight from Events lands on Controls.
     await page.waitForFunction(() => location.hash === "#controls");
     expect(new URL(page.url()).hash).toBe("#controls");
     expect(await page.locator("[data-tab-panel]:visible").count()).toBe(1);
@@ -78,7 +78,7 @@ describe.skipIf(!browser)("relay dashboard browser flows", () => {
     await page.goto(server.url, { waitUntil: "networkidle" });
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0);
     expect(await page.locator("#stateTitle").textContent()).toContain("Relay");
-    await page.getByRole("tab", { name: /Activity/ }).click();
+    await page.locator("#tab-events").click();
     expect(await page.locator(".pod-chip").first().isVisible()).toBe(true);
     expect(await page.locator(".outcome").first().isVisible()).toBe(true);
     await page.close();
