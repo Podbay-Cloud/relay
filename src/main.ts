@@ -22,6 +22,7 @@ import { BrowserFetcher } from "./browser-fetcher.js";
 import { RelayEventStore, type RelaySource } from "./audit.js";
 import { serveDashboard } from "./dashboard.js";
 import { RelayRuntime } from "./runtime.js";
+import { attachHeartbeat } from "./heartbeat.js";
 import { DISCLOSURE } from "./disclosure.js";
 import { c, rows } from "./colors.js";
 import { normalizeDomain } from "./domain.js";
@@ -198,6 +199,10 @@ async function runDaemon(a: string[]): Promise<void> {
       backoff = 1000;
       runtime.setGateway("connected");
       sink.send(JSON.stringify({ type: "relay-online", loginDomains: load().loginDomains }));
+      // Detect a zombie link (slept laptop / network change): without this a half-open
+      // socket never fires `close`, so the reconnect below never runs. The heartbeat
+      // terminate()s a silent link → `close` fires → reconnect. Self-clears on close.
+      attachHeartbeat(ws, 20_000);
     });
     ws.on("message", (d) => {
       const raw = String(d);
@@ -335,12 +340,18 @@ async function cmdDashboard(a: string[]): Promise<void> {
   await new Promise(() => {}); // stay up until Ctrl-C
 }
 
-function cmdStatus(): void {
+async function cmdStatus(): Promise<void> {
   const pid = isRunning();
   const cfg = load();
-  const label = (s: string) => c.dim(s.padEnd(9));
+  // Pad wider than the longest label ("dashboard", 9) so every value has a gutter —
+  // padEnd(9) left "dashboard" flush against its URL.
+  const label = (s: string) => c.dim(s.padEnd(11));
   log("");
   log(`${label("relay")}${pid ? c.green(`running`) + c.dim(` (pid ${pid})`) : c.yellow("not running")}`);
+  // The PROCESS being alive is not the same as the gateway LINK being up — a slept host
+  // leaves a dead link the process can't see. Ask the daemon's own dashboard for the
+  // live state so status stops reporting "running" over a dead link.
+  if (pid) log(`${label("link")}${await gatewayLinkState()}`);
   log(`${label("gateway")}${cfg.gatewayUrl ? c.cyan(cfg.gatewayUrl) : c.dim("(unset)")}`);
   log(`${label("dashboard")}${dashboardUrl() ? c.cyan(dashboardUrl()!) : c.dim("pb relay dashboard opens saved history")}`);
   log(
@@ -349,6 +360,42 @@ function cmdStatus(): void {
     }`,
   );
   log("");
+}
+
+/** Live gateway-link state, read from the running daemon's local dashboard (`/data`).
+ * The daemon owns this in memory ("never state files"), so a separate `relay status`
+ * can only learn it by asking the daemon — this is what makes status honest about a
+ * link that dropped (host asleep/offline) instead of just "the process is alive". */
+async function gatewayLinkState(): Promise<string> {
+  const base = dashboardUrl();
+  if (!base) return c.dim("unknown (dashboard not up yet)");
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 1500);
+    const res = await fetch(`${base}/data`, { signal: ac.signal }).finally(() => clearTimeout(timer));
+    const data = (await res.json()) as { state?: string };
+    if (data.state === "connected") return c.green("connected");
+    if (data.state === "reconnecting") return c.yellow("reconnecting… (host asleep or offline)");
+    if (data.state === "stopped") return c.yellow("stopped");
+    return c.dim("unknown");
+  } catch {
+    return c.yellow("unreachable — the relay daemon isn't responding (try: pb relay restart)");
+  }
+}
+
+/** Stop-then-start, reusing the stored gateway + reconnect token. The escape hatch for a
+ * link that won't come back on its own — though the heartbeat should now auto-recover it. */
+async function cmdRestart(a: string[]): Promise<void> {
+  const pid = isRunning();
+  if (pid) {
+    process.kill(pid, "SIGTERM");
+    try { unlinkSync(pidFile()); } catch {}
+    await new Promise((r) => setTimeout(r, 600)); // let it release the pid + dashboard port
+    log(c.dim("restarting the relay…"));
+  } else {
+    log(c.dim("no relay was running — starting it."));
+  }
+  return cmdStart(a);
 }
 
 function cmdStop(): void {
@@ -366,6 +413,7 @@ async function relay(a: string[]): Promise<void> {
     case "dashboard": return cmdDashboard(a.slice(1));
     case "status": return cmdStatus();
     case "stop": return cmdStop();
+    case "restart": return cmdRestart(a.slice(1));
     case "reset": resetProfile(); return log(`${c.green("✓")} wiped the relay's sessions, logins, and pairing.`);
     default:
       return relayUsage();
@@ -384,8 +432,9 @@ function relayUsage(): void {
     rows([
       ["login <site>", "let one site be fetched as you (everything else stays clean)"],
       ["dashboard", "open a local page of what it has fetched"],
-      ["status", "is it running, and for which sites"],
+      ["status", "is it running, is the gateway link up, and for which sites"],
       ["stop", "stop the relay"],
+      ["restart", "stop then start it (e.g. after the host slept)"],
       ["reset", "forget all sessions, logins, and pairing"],
     ]),
   );

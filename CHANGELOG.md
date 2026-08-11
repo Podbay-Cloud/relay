@@ -3,6 +3,19 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.13
+
+- **The relay recovers on its own after the host sleeps or changes networks.** A slept laptop left
+  the gateway connection half-open — no disconnect event fired, so the relay sat on a dead link
+  still reporting "connected" while all egress silently failed, until you manually restarted it.
+  A ping/pong heartbeat now detects the zombie link and closes it, so the existing auto-reconnect
+  brings the relay back on its own (typically within a minute of waking).
+- **`pb relay status` now reports the live gateway link**, not just whether the process is alive:
+  a "link" line reads connected / reconnecting / unreachable from the running relay. (Also fixed the
+  squished "dashboard" row.)
+- **New `pb relay restart`** — stop then start, reusing your pairing. The manual escape hatch (though
+  the heartbeat above should make it rarely necessary).
+
 ## 0.1.12
 
 - **Pods show their name, not just the slug.** When the gateway sends a pod's owner-chosen display
