@@ -3,6 +3,13 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.12
+
+- **Pods show their name, not just the slug.** When the gateway sends a pod's owner-chosen display
+  name, the dashboard shows it everywhere a pod appears — events, live, the pod filter, and Controls
+  — falling back to the id when there's no name. (The id stays the stable key behind the scenes.)
+  Requires an up-to-date gateway; older gateways still show the id, harmlessly.
+
 ## 0.1.11
 
 - **Sites: filter by domain** — a search box on the Sites view. And each domain's "N events" and

@@ -47,6 +47,16 @@ describe("relay v2 event sanitization", () => {
     expect(JSON.stringify(safe)).not.toMatch(/pass|secret|token=|#y/);
   });
 
+  it("preserves the gateway-resolved pod display name, bounded to 160", () => {
+    expect(sanitizeEvent(event({ source: { podId: "p1", podName: "My Crawler" } }))?.source)
+      .toEqual({ podId: "p1", podName: "My Crawler" });
+    // Over-long names are sliced like the id (never trust the wire).
+    const long = sanitizeEvent(event({ source: { podId: "p1", podName: "x".repeat(500) } as never }));
+    expect((long?.source as { podName?: string }).podName?.length).toBe(160);
+    // Absent name (old gateway / old row) → source is just the id.
+    expect(sanitizeEvent(event({ source: { podId: "p1" } }))?.source).toEqual({ podId: "p1" });
+  });
+
   it("normalizes tunnel targets and rejects malformed targets", () => {
     expect(safeTunnelTarget("Example.COM.", 443)).toEqual({ target: "example.com:443", host: "example.com" });
     expect(safeTunnelTarget("bad host", 443)).toBeNull();

@@ -19,7 +19,7 @@ export type RelayOutcome =
   | "safety-blocked"
   | "rate-limited"
   | "network-error";
-export type RelaySource = { podId: string } | { system: "health-check" };
+export type RelaySource = { podId: string; podName?: string } | { system: "health-check" };
 
 /** The only detailed event shape allowed across the local persistence boundary. */
 export interface RelayEventV2 {
@@ -88,8 +88,14 @@ export function fetchOutcome(status: number, error?: string): RelayOutcome {
 
 function sourceOf(value: unknown): RelaySource | undefined {
   if (!value || typeof value !== "object") return undefined;
-  const source = value as { podId?: unknown; system?: unknown };
-  if (typeof source.podId === "string" && source.podId.trim()) return { podId: source.podId.slice(0, 160) };
+  const source = value as { podId?: unknown; podName?: unknown; system?: unknown };
+  if (typeof source.podId === "string" && source.podId.trim()) {
+    const out: { podId: string; podName?: string } = { podId: source.podId.slice(0, 160) };
+    // Gateway-authoritative display name, bounded like the id. Optional — absent means
+    // the dashboard shows the id. (Old rows / old gateways simply omit it.)
+    if (typeof source.podName === "string" && source.podName.trim()) out.podName = source.podName.slice(0, 160);
+    return out;
+  }
   if (source.system === "health-check") return { system: "health-check" };
   return undefined;
 }
