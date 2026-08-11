@@ -3,6 +3,12 @@
 All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
+## 0.1.14
+
+- **Faster relay drop detection.** The sleep/network-drop heartbeat now catches a dead gateway link
+  in ~15s (a 10s ping with a 5s pong window) instead of up to ~40s, so egress recovers sooner after
+  the host wakes — fewer failed connections at the start of a crawl.
+
 ## 0.1.13
 
 - **The relay recovers on its own after the host sleeps or changes networks.** A slept laptop left

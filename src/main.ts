@@ -201,8 +201,9 @@ async function runDaemon(a: string[]): Promise<void> {
       sink.send(JSON.stringify({ type: "relay-online", loginDomains: load().loginDomains }));
       // Detect a zombie link (slept laptop / network change): without this a half-open
       // socket never fires `close`, so the reconnect below never runs. The heartbeat
-      // terminate()s a silent link → `close` fires → reconnect. Self-clears on close.
-      attachHeartbeat(ws, 20_000);
+      // terminate()s a silent link → `close` fires → reconnect. ~15s worst-case detection
+      // (10s ping + 5s pong). Self-clears on close.
+      attachHeartbeat(ws);
     });
     ws.on("message", (d) => {
       const raw = String(d);
