@@ -28,13 +28,13 @@ import { c, rows } from "./colors.js";
 import { normalizeDomain } from "./domain.js";
 
 /**
- * `pb relay` — one command starts a background relay; login/dashboard/stop modify it
+ * `relay` — one command starts a background relay; login/dashboard/stop modify it
  * through disk state (config, audit log, pidfile). No per-request approval: once
  * running, the pod fetches the public web freely; the owner watches via the dashboard.
  */
 process.stdout.on("error", (e: NodeJS.ErrnoException) => { if (e.code === "EPIPE") process.exit(0); });
 const log = (s = ""): void => { try { process.stdout.write(s + "\n"); } catch { /* EPIPE */ } };
-const die = (s: string): never => { process.stderr.write(`pb: ${s}\n`); process.exit(1); };
+const die = (s: string): never => { process.stderr.write(`relay: ${s}\n`); process.exit(1); };
 const arg = (a: string[], f: string) => { const i = a.indexOf(f); return i >= 0 ? a[i + 1] : undefined; };
 
 function isRunning(): number | null {
@@ -84,12 +84,12 @@ async function waitForDashboardUrl(timeoutMs = 2000): Promise<string | null> {
 
 async function cmdStart(a: string[]): Promise<void> {
   if (a.includes("__daemon")) return runDaemon(a);
-  if (isRunning()) die("a relay is already running (pb relay stop to stop it).");
+  if (isRunning()) die("a relay is already running (relay stop to stop it).");
 
   const cfg = load();
   const gateway = arg(a, "--gateway") ?? cfg.gatewayUrl ?? die("need --gateway wss://…");
   // A code is only needed for FIRST pairing; a stored reconnect token lets a plain
-  // `pb relay start` bring the relay back up (e.g. after a reboot) with no new code.
+  // `relay start` bring the relay back up (e.g. after a reboot) with no new code.
   const code = arg(a, "--code") ?? "";
   if (!code && !cfg.reconnectToken) die("need --code (from your pod dashboard) to pair the first time");
 
@@ -105,7 +105,7 @@ async function cmdStart(a: string[]): Promise<void> {
   // Spawn ourselves detached: one command, then it runs in the background.
   mkdirSync(profileDir().replace(/\/profile$/, ""), { recursive: true });
   const self = fileURLToPath(import.meta.url);
-  const child = spawn(process.execPath, [self, "relay", "start", "__daemon", "--gateway", gateway, "--code", code], {
+  const child = spawn(process.execPath, [self, "start", "__daemon", "--gateway", gateway, "--code", code], {
     detached: true,
     stdio: "ignore",
   });
@@ -117,9 +117,9 @@ async function cmdStart(a: string[]): Promise<void> {
   log("");
   log(
     rows([
-      ["pb relay dashboard", "see what it has fetched"],
-      ["pb relay login <site>", "let a site be fetched as you"],
-      ["pb relay stop", "stop it"],
+      ["relay dashboard", "see what it has fetched"],
+      ["relay login <site>", "let a site be fetched as you"],
+      ["relay stop", "stop it"],
     ]),
   );
   if (commandCenter) log(`\n  ${c.dim("command center")}  ${c.cyan(commandCenter)}`);
@@ -131,7 +131,7 @@ async function runDaemon(a: string[]): Promise<void> {
   const code = arg(a, "--code") ?? "";
   const browser = new BrowserFetcher({
     profileDir: profileDir(),
-    // Re-read config each fetch: `pb relay login` writes there and we pick it up live.
+    // Re-read config each fetch: `relay login` writes there and we pick it up live.
     isSessionDomain: (host) => load().loginDomains.some((d) => host === d || host.endsWith(`.${d}`)),
   });
   const cfgAtStart = load();
@@ -187,9 +187,9 @@ async function runDaemon(a: string[]): Promise<void> {
     };
     const client = new RelayClient(sink, browser.fetch, { audit: (event) => store.append(event), runtime, deny });
     // The SAME relay also serves the egress tunnel: the pod's apps connect through here
-    // and egress from this machine. One `pb relay start`, both consumers.
+    // and egress from this machine. One `relay start`, both consumers.
     const tunnel = new RelayTunnel(sink, {
-      // Tunnel connections land in the SAME local audit as fetches, so `pb relay
+      // Tunnel connections land in the SAME local audit as fetches, so `relay
       // dashboard` shows one history: host, whether it was allowed, and why not.
       audit: (event) => { store.append(event); },
       runtime,
@@ -252,9 +252,9 @@ async function runDaemon(a: string[]): Promise<void> {
 }
 
 async function cmdLogin(a: string[]): Promise<void> {
-  const domain = normalizeDomain(a[0] ?? die("usage: pb relay login <domain>"));
+  const domain = normalizeDomain(a[0] ?? die("usage: relay login <domain>"));
   const pw = (await import("playwright").catch(() =>
-    die("Playwright missing — reinstall: npx @podbay/pb@latest"),
+    die("Playwright missing — reinstall: npx @podbay/relay@latest"),
   )) as typeof import("playwright");
   log(`opening a browser so you can sign in to ${domain}. This is the relay's OWN profile.`);
   const ctx = await pw.chromium.launchPersistentContext(profileDir(), { headless: false, channel: "chrome" });
@@ -312,7 +312,7 @@ async function cmdLogin(a: string[]): Promise<void> {
   if (hasSession) {
     log(`  ${c.green("✓ signed in")} ${c.dim(`— ${domain} will now be fetched as you; every other site stays clean.`)}`);
   } else {
-    log(`  ${c.yellow("⚠ saved, but I didn't see a session")} ${c.dim(`for ${domain}. If a fetch hits a login wall, run`)} ${c.bold(`pb relay login ${domain}`)} ${c.dim("again and complete the sign-in.")}`);
+    log(`  ${c.yellow("⚠ saved, but I didn't see a session")} ${c.dim(`for ${domain}. If a fetch hits a login wall, run`)} ${c.bold(`relay login ${domain}`)} ${c.dim("again and complete the sign-in.")}`);
   }
   log("");
 }
@@ -354,7 +354,7 @@ async function cmdStatus(): Promise<void> {
   // live state so status stops reporting "running" over a dead link.
   if (pid) log(`${label("link")}${await gatewayLinkState()}`);
   log(`${label("gateway")}${cfg.gatewayUrl ? c.cyan(cfg.gatewayUrl) : c.dim("(unset)")}`);
-  log(`${label("dashboard")}${dashboardUrl() ? c.cyan(dashboardUrl()!) : c.dim("pb relay dashboard opens saved history")}`);
+  log(`${label("dashboard")}${dashboardUrl() ? c.cyan(dashboardUrl()!) : c.dim("relay dashboard opens saved history")}`);
   log(
     `${label("as-you")}${
       cfg.loginDomains.length ? cfg.loginDomains.join(", ") : c.dim("no sites signed in — all fetches are clean")
@@ -380,7 +380,7 @@ async function gatewayLinkState(): Promise<string> {
     if (data.state === "stopped") return c.yellow("stopped");
     return c.dim("unknown");
   } catch {
-    return c.yellow("unreachable — the relay daemon isn't responding (try: pb relay restart)");
+    return c.yellow("unreachable — the relay daemon isn't responding (try: relay restart)");
   }
 }
 
@@ -407,7 +407,7 @@ function cmdStop(): void {
   log(`${c.green("✓")} relay stopped.`);
 }
 
-async function relay(a: string[]): Promise<void> {
+async function dispatch(a: string[]): Promise<void> {
   switch (a[0]) {
     case "start": return cmdStart(a.slice(1));
     case "login": return cmdLogin(a.slice(1));
@@ -417,17 +417,17 @@ async function relay(a: string[]): Promise<void> {
     case "restart": return cmdRestart(a.slice(1));
     case "reset": resetProfile(); return log(`${c.green("✓")} wiped the relay's sessions, logins, and pairing.`);
     default:
-      return relayUsage();
+      return usage();
   }
 }
 
-function relayUsage(): void {
+function usage(): void {
   log("");
-  log(`${c.bold("pb relay")} ${c.dim("— fetch web pages through this machine for your Podbay pods")}`);
+  log(`${c.bold("relay")} ${c.dim("— fetch web pages through this machine for your Podbay pods")}`);
   log("");
   // `start` carries flags, so it gets its own line rather than blowing out the column.
   log(`  ${c.cyan("start")}  ${c.dim("run the relay in the background:")}`);
-  log(`         ${c.dim("pb relay start --gateway <url> --code <code> --accept")}`);
+  log(`         ${c.dim("relay start --gateway <url> --code <code> --accept")}`);
   log("");
   log(
     rows([
@@ -443,8 +443,11 @@ function relayUsage(): void {
 }
 
 async function main(): Promise<void> {
-  const [, , cmd, ...rest] = process.argv;
-  if (cmd === "relay") return relay(rest);
-  relayUsage();
+  const [, , ...args] = process.argv;
+  // The binary IS `relay` now, so commands are top-level (`relay start`, `relay login <site>`).
+  // Tolerate a stray leading `relay` — old `relay …` muscle memory, and the daemon's own
+  // respawn — so `relay relay start` still resolves.
+  if (args[0] === "relay") args.shift();
+  return dispatch(args);
 }
 void main();

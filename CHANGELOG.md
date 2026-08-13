@@ -1,9 +1,15 @@
 # Changelog
 
-All notable changes to `pb` (the Podbay relay CLI). This mirrors the package published to
-npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
+All notable changes to `relay` (the Podbay relay CLI). This mirrors the package published to
+npm as [`@podbay/relay`](https://www.npmjs.com/package/@podbay/relay).
 
-## 0.1.14
+## 0.2.0
+
+- **Renamed: `@podbay/pb` → `@podbay/relay`, and the command `pb` → `relay`.** The tool is a relay,
+  so it's now named one. Commands are top-level — `pb relay start` becomes **`relay start`**,
+  `pb relay login <site>` becomes **`relay login <site>`**, etc. (a stray leading `relay` is still
+  tolerated). Install with `npm i -g @podbay/relay`; `@podbay/pb` is deprecated and points here.
+  The public source mirror moved to `github.com/podbay-cloud/relay`.
 
 - **Faster relay drop detection.** The sleep/network-drop heartbeat now catches a dead gateway link
   in ~15s (a 10s ping with a 5s pong window) instead of up to ~40s, so egress recovers sooner after
@@ -16,10 +22,10 @@ npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
   still reporting "connected" while all egress silently failed, until you manually restarted it.
   A ping/pong heartbeat now detects the zombie link and closes it, so the existing auto-reconnect
   brings the relay back on its own (typically within a minute of waking).
-- **`pb relay status` now reports the live gateway link**, not just whether the process is alive:
+- **`relay status` now reports the live gateway link**, not just whether the process is alive:
   a "link" line reads connected / reconnecting / unreachable from the running relay. (Also fixed the
   squished "dashboard" row.)
-- **New `pb relay restart`** — stop then start, reusing your pairing. The manual escape hatch (though
+- **New `relay restart`** — stop then start, reusing your pairing. The manual escape hatch (though
   the heartbeat above should make it rarely necessary).
 
 ## 0.1.12
@@ -74,7 +80,7 @@ npm as [`@podbay/pb`](https://www.npmjs.com/package/@podbay/pb).
 
 ## 0.1.7
 
-- **Relay concurrency ceiling is now legible.** `pb relay check` reports live capacity
+- **Relay concurrency ceiling is now legible.** `relay check` reports live capacity
   (e.g. "N of 32 streams in use"), and refusals are classified — capacity, rate limit, or
   no-relay — so a client can size its concurrency to the cap and back off on the right signal
   instead of guessing.

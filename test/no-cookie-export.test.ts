@@ -30,7 +30,7 @@ describe("the relay never exports its session to a pod", () => {
   });
 
   it("reads cookies ONLY to check a session exists — never to move one", () => {
-    // A blanket ban on `.cookies(` was a false positive: `pb relay login` reads them to
+    // A blanket ban on `.cookies(` was a false positive: `relay login` reads them to
     // answer "did the sign-in actually take?" and only ever looks at the COUNT. That is
     // not an export. So allow exactly that shape and fail any other use — a new call
     // site, or this one starting to touch a cookie's value, breaks the build.

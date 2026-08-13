@@ -1,6 +1,6 @@
 # pb — the Podbay relay
 
-`pb relay` runs a small relay on your own machine so a Podbay pod can reach the web
+`relay` runs a small relay on your own machine so a Podbay pod can reach the web
 **from your network** instead of from a datacenter. Many sites block cloud IPs at the
 edge; the relay lets your pod read them from your home address — and, only where you
 choose, using sites you're signed into.
@@ -20,7 +20,7 @@ the datacenter.
 
 ```bash
 # your pod will print the exact command, pinned to a version and pairing code:
-npx @podbay/pb@<version> relay start --code <code> --accept
+npx @podbay/relay@<version> relay start --code <code> --accept
 ```
 
 That's it — it runs in the background and serves fetches for your pods.
@@ -30,7 +30,7 @@ That's it — it runs in the background and serves fetches for your pods.
 - **Open by default, clean by default.** Once running, your pod can fetch the public
   web through it. Every fetch uses a **fresh, cookie-less browser** — your residential
   IP, but none of your accounts.
-- **Fetch a site *as you* only when you say so.** `pb relay login <site>` opens a
+- **Fetch a site *as you* only when you say so.** `relay login <site>` opens a
   browser, you sign in once, and from then on **that site** is fetched with your
   session. Everything else stays clean. A pod can never read an account you didn't
   explicitly lend.
@@ -39,9 +39,9 @@ That's it — it runs in the background and serves fetches for your pods.
 - **Never your session, only pages.** It returns page content to the pod, never a
   cookie or a login.
 - **The tunnel carries your IP, never your accounts.** Sites reached through the proxy
-  get a clean context — "as you" stays a `pb relay login` thing, and the tunnel does not
+  get a clean context — "as you" stays a `relay login` thing, and the tunnel does not
   replicate it.
-- **You can inspect and narrow it.** `pb relay dashboard` opens a loopback-only command
+- **You can inspect and narrow it.** `relay dashboard` opens a loopback-only command
   center with live state, chronological activity, per-pod and per-site summaries, and
   explicit outcomes (site refusal, owner block, safety block, rate limit, or network
   error). Pause one pod, block one site, revoke a site's signed-in use, export or clear
@@ -52,12 +52,12 @@ That's it — it runs in the background and serves fetches for your pods.
 
 | command | what |
 |---|---|
-| `pb relay start --code <c> --gateway <url> --accept` | run the relay in the background |
-| `pb relay login <domain>` | let one site be fetched as you |
-| `pb relay dashboard` | open the local command center; show saved history read-only when stopped |
-| `pb relay status` | is it running, and what's lent |
-| `pb relay stop` | stop it |
-| `pb relay reset` | wipe its saved sessions |
+| `relay start --code <c> --gateway <url> --accept` | run the relay in the background |
+| `relay login <domain>` | let one site be fetched as you |
+| `relay dashboard` | open the local command center; show saved history read-only when stopped |
+| `relay status` | is it running, and what's lent |
+| `relay stop` | stop it |
+| `relay reset` | wipe its saved sessions |
 
 ## Trust
 

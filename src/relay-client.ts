@@ -4,7 +4,7 @@
  * The design (decided 2026-07-31): once the owner starts the relay, the pod may fetch
  * the public web through it freely — no per-request approval, because nobody watches a
  * terminal to click "allow". Oversight is after the fact: every fetch is audited, and
- * the owner monitors via `pb relay dashboard` and the admin dashboard.
+ * the owner monitors via `relay dashboard` and the admin dashboard.
  *
  * Two guards remain, and both protect the OWNER, not us:
  *  1. The relay refuses a URL that is not a plain web address or resolves to a bare IP
@@ -12,7 +12,7 @@
  *     machine hit their own LAN (192.168.x, 10.x, localhost) — an SSRF the owner cannot
  *     see to consent to.
  *  2. WHICH sessions are used is decided by the fetcher: a domain the owner explicitly
- *     signed into (`pb relay login`) is fetched AS them; every other domain is fetched
+ *     signed into (`relay login`) is fetched AS them; every other domain is fetched
  *     from a CLEAN context with no cookies. So "fetch as me" is opt-in per site, and a
  *     compromised pod cannot read accounts the owner never lent it.
  *
