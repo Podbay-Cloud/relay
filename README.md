@@ -1,6 +1,6 @@
-# pb — the Podbay relay
+# The Podbay relay
 
-`relay` runs a small relay on your own machine so a Podbay pod can reach the web
+It runs a small relay on your own machine so a Podbay pod can reach the web
 **from your network** instead of from a datacenter. Many sites block cloud IPs at the
 edge; the relay lets your pod read them from your home address — and, only where you
 choose, using sites you're signed into.
@@ -19,7 +19,7 @@ with no relay running, those connections are refused rather than quietly leaving
 the datacenter.
 
 ```bash
-# your pod will print the exact command, pinned to a version and pairing code:
+# Go to you dashboard settings to see the exact command, pinned to a version and pairing code:
 npx @podbay/relay@<version> relay start --code <code> --accept
 ```
 
@@ -57,31 +57,12 @@ That's it — it runs in the background and serves fetches for your pods.
 | `relay dashboard` | open the local command center; show saved history read-only when stopped |
 | `relay status` | is it running, and what's lent |
 | `relay stop` | stop it |
+| `relay restart` | restart it |
 | `relay reset` | wipe its saved sessions |
 
-## Trust
-
-This program holds the browser sessions you sign into and fetches on your behalf, so
-it is **open source (Apache-2.0)** — read exactly what it does before you run it. It
-uses a **separate browser profile it owns**; your everyday browser, history and
-cookies are never touched. Automating a signed-in session may breach a site's terms,
-and the account at risk is yours.
-
 ## Local command center and history
-
-Return to the command center to verify the relay is connected, see which pod borrowed
-your connection, diagnose a refusal, review signed-in use, or narrow access. While the
-daemon runs it serves live state and controls. When stopped, the same command serves
-retained history read-only. The CLI always prints the URL; opening a browser is
-best-effort, so it remains usable on headless machines without `xdg-open`.
 
 Detailed events stay under `~/.podbay/relay/events` in owner-only, day-partitioned
 files. They include the gateway-attributed pod id when available, mode, sanitized
 target, timing, outcome, status, signed-in use, and tunnel bytes. The default retention
 is 30 days; the command center offers 7, 30, or 90 days and a hard disk ceiling.
-
-Before disk write, fetch URLs lose usernames, passwords, query strings, and fragments.
-Cookies, authorization headers, browser storage, request/response bodies, and tunnel
-content are never event fields. Podbay does not receive the local path-level history or
-exports; hosted telemetry remains coarse and domain-level. Clearing history does not
-clear pairing, sessions, paused pods, or blocked sites.
