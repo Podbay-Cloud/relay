@@ -3,6 +3,16 @@
 All notable changes to `relay` (the Podbay relay CLI). This mirrors the package published to
 npm as [`@podbay/relay`](https://www.npmjs.com/package/@podbay/relay).
 
+## 0.2.2
+
+- **`relay start --keep-awake`** — opt-in mode for a Mac meant to stay online 24/7: while the relay
+  runs, it prevents the Mac from idle-sleeping (macOS `caffeinate -is`, auto-released when the relay
+  exits — a crash never leaves your Mac stuck awake). Persisted, so it survives restarts;
+  `--no-keep-awake` turns it back off. Off by default (a laptop should still be free to sleep). On
+  Linux/Windows it's a no-op with a note — use your power settings there. Pairs with the 0.2.1
+  heartbeat hardening: 0.2.1 stops the *self-inflicted* flaps, `--keep-awake` stops the Mac
+  idle-sleeping the link out from under a dedicated relay host.
+
 ## 0.2.1
 
 - **Heartbeat hardened against macOS throttling — stops the relay dropping its OWN connection.** The
